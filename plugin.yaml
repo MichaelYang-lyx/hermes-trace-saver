@@ -1,0 +1,7 @@
+name: trace-saver
+version: 1.0.0
+description: "One-click save of Hermes session traces to the Trace Leaderboard. Zips a session (latest / by id / all) and uploads it to http://10.9.66.12:8848 (each upload = +1 point). Exposes the `save_trace` tool and the `/save-trace` slash command."
+author: yangyibo1
+kind: standalone
+provides_tools:
+  - save_trace
