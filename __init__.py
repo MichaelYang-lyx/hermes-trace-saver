@@ -30,9 +30,11 @@ import sys
 # (tests), fall back to putting our own dir on sys.path.
 try:
     from . import uploader  # type: ignore[attr-defined]
+    from . import filepicker  # type: ignore[attr-defined]
 except ImportError:  # pragma: no cover - standalone / test path
     sys.path.insert(0, os.path.dirname(__file__))
     import uploader  # type: ignore[no-redef]
+    import filepicker  # type: ignore[no-redef]
 
 
 SAVE_TRACE_SCHEMA = {
@@ -207,6 +209,224 @@ def _handle_slash(raw_args: str):
         return f"⚠️  save-trace failed: {type(exc).__name__}: {exc}"
 
 
+# --------------------------------------------------------------------------- #
+# /upload-files — bundle arbitrary files (auto-scanned or explicit) into a zip
+# --------------------------------------------------------------------------- #
+UPLOAD_FILES_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "upload_files",
+        "description": (
+            "Bundle files into a single .zip and upload it to the Trace "
+            "Leaderboard (+1). Two modes: (1) pass an explicit list of paths, "
+            "or (2) leave paths empty to auto-scan the current session for "
+            "files touched by read_file / write_file / patch / terminal. "
+            "Sensitive names, files > 50MB, and tool-owned dirs (.hermes, "
+            ".git, node_modules...) are filtered out. Set local=true to keep "
+            "the .zip locally without uploading."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Explicit files to bundle. When empty, the tool "
+                        "auto-scans the current session."
+                    ),
+                    "default": [],
+                },
+                "name": {
+                    "type": "string",
+                    "description": (
+                        "Leaderboard display name (default: "
+                        "$TRACE_LEADERBOARD_NAME or system user)."
+                    ),
+                },
+                "note": {
+                    "type": "string",
+                    "description": "Free-text note stored in the zip's manifest.",
+                },
+                "local": {
+                    "type": "boolean",
+                    "description": "Save the .zip locally instead of uploading.",
+                    "default": False,
+                },
+                "out_dir": {
+                    "type": "string",
+                    "description": (
+                        "When local=true, the directory to write into. "
+                        "Defaults to $TRACE_SAVE_DIR or ~/hermes-traces."
+                    ),
+                },
+            },
+            "required": [],
+        },
+    },
+}
+
+
+def _scan_and_filter():
+    """Auto-scan the latest session, return (kept, rejected, session_path)."""
+    session_path = None
+    sessions = uploader.list_sessions()
+    if sessions:
+        session_path = sessions[0]
+    raw = filepicker.scan_session(session_path)
+    from pathlib import Path as _P
+    kept, rejected = filepicker.filter_paths([_P(p) for p in raw])
+    return kept, rejected, session_path
+
+
+def _do_upload_files(paths=None, name=None, note="", local=False,
+                     out_dir=None) -> dict:
+    """Common backend: normalize inputs and hand off to uploader.upload_files."""
+    return uploader.upload_files(
+        files=[p for p in (paths or [])],
+        name=name,
+        note=note or "",
+        local=local,
+        out_dir=out_dir,
+    )
+
+
+def _handle_upload_files_tool(args: dict, **_kw) -> str:
+    from tools.registry import tool_error, tool_result
+
+    args = args or {}
+    paths = args.get("paths") or []
+    name = args.get("name")
+    note = args.get("note") or ""
+    local = _coerce_bool(args.get("local", False))
+    out_dir = args.get("out_dir") or None
+
+    try:
+        if not paths:
+            # Auto-scan mode: filter and upload (agent path implicitly consents).
+            kept, rejected, _ = _scan_and_filter()
+            if not kept:
+                return tool_error(
+                    "auto-scan found no eligible files in the current session "
+                    "(all filtered by safety rules or missing). "
+                    "Pass explicit `paths` to override."
+                )
+            paths = [str(p) for p in kept]
+        res = _do_upload_files(paths=paths, name=name, note=note,
+                               local=local, out_dir=out_dir)
+        return tool_result(res)
+    except (FileNotFoundError, ValueError) as exc:
+        return tool_error(str(exc))
+    except ConnectionError as exc:
+        return tool_error(f"Leaderboard unreachable: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        return tool_error(f"upload_files failed: {type(exc).__name__}: {exc}")
+
+
+_UPLOAD_FILES_HELP = (
+    "/upload-files — bundle files into a zip and upload\n"
+    "\n"
+    "Explicit files:\n"
+    "  /upload-files a.xlsx b.xlsx           bundle these two files, upload\n"
+    "  /upload-files a.xlsx --local          save the bundle locally, no upload\n"
+    "  /upload-files a.xlsx -n \"weekly\"      attach a note in the zip manifest\n"
+    "\n"
+    "Auto-scan current session (preview, then confirm):\n"
+    "  /upload-files                          scan + preview the file list\n"
+    "  /upload-files --yes                    scan + upload without preview\n"
+    "  /upload-files --yes --local            scan + save locally\n"
+    "\n"
+    "Safety filters (always on): drops .env / *.key / *.pem / SSH keys,\n"
+    "files > 50 MB, and paths under .hermes / .git / node_modules etc.\n"
+)
+
+
+def _parse_upload_files_args(argv):
+    """Slash arg parser. Returns (paths, name, note, local, out_dir, yes)."""
+    paths, name, note = [], None, ""
+    local, out_dir, yes = False, None, False
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in ("--local", "-l"):
+            local = True
+        elif tok in ("--yes", "-y"):
+            yes = True
+        elif tok in ("--name",):
+            if i + 1 >= len(argv):
+                raise ValueError("--name needs a value")
+            name = argv[i + 1]; i += 1
+        elif tok in ("--note", "-n"):
+            if i + 1 >= len(argv):
+                raise ValueError("-n needs a value")
+            note = argv[i + 1]; i += 1
+        elif tok in ("--out-dir", "--out", "-o"):
+            if i + 1 >= len(argv):
+                raise ValueError(f"{tok} needs a directory")
+            out_dir = argv[i + 1]; local = True; i += 1
+        elif tok.startswith("--out-dir="):
+            out_dir = tok.split("=", 1)[1]; local = True
+        elif tok.startswith("--name="):
+            name = tok.split("=", 1)[1]
+        elif tok.startswith("--note="):
+            note = tok.split("=", 1)[1]
+        elif tok in ("help", "-h", "--help"):
+            return "HELP", None, None, None, None, None
+        else:
+            paths.append(tok)
+        i += 1
+    return paths, name, note, local, out_dir, yes
+
+
+def _handle_upload_files_slash(raw_args: str):
+    argv = (raw_args or "").split()
+    try:
+        parsed = _parse_upload_files_args(argv)
+    except ValueError as exc:
+        return f"⚠️  {exc}\n\n{_UPLOAD_FILES_HELP}"
+    if parsed[0] == "HELP":
+        return _UPLOAD_FILES_HELP
+    paths, name, note, local, out_dir, yes = parsed
+
+    try:
+        # --- Explicit paths: bypass scan, no preview needed ---
+        if paths:
+            res = _do_upload_files(paths=paths, name=name, note=note,
+                                   local=local, out_dir=out_dir)
+            icon = "💾" if res.get("mode") == "local" else "📎"
+            return f"{icon} {res['message']}"
+
+        # --- Auto-scan mode ---
+        kept, rejected, session_path = _scan_and_filter()
+        if not kept:
+            body = filepicker.format_preview(kept, rejected,
+                                             session_path=session_path)
+            return (
+                "⚠️  No eligible files found in the current session.\n\n"
+                + body
+                + "\n\nHint: pass explicit paths, e.g. `/upload-files a.xlsx b.xlsx`."
+            )
+        if not yes:
+            # Preview only. User re-runs with --yes to confirm.
+            return filepicker.format_preview(kept, rejected,
+                                             session_path=session_path)
+
+        # yes → do the upload/save
+        res = _do_upload_files(
+            paths=[str(p) for p in kept],
+            name=name, note=note, local=local, out_dir=out_dir,
+        )
+        icon = "💾" if res.get("mode") == "local" else "📎"
+        return f"{icon} {res['message']}"
+
+    except (FileNotFoundError, ValueError) as exc:
+        return f"⚠️  {exc}"
+    except ConnectionError as exc:
+        return f"⚠️  Leaderboard unreachable: {exc}"
+    except Exception as exc:  # noqa: BLE001
+        return f"⚠️  upload-files failed: {type(exc).__name__}: {exc}"
+
+
 def register(ctx) -> None:
     """Called once by the Hermes plugin loader."""
     ctx.register_tool(
@@ -229,4 +449,25 @@ def register(ctx) -> None:
             "by default; --local keeps it on disk without uploading."
         ),
         args_hint="[--local] [latest|all|<id>] [name] [-o dir]",
+    )
+    ctx.register_tool(
+        name="upload_files",
+        toolset="trace",
+        schema=UPLOAD_FILES_SCHEMA,
+        handler=_handle_upload_files_tool,
+        check_fn=_check_available,
+        emoji="📎",
+        description=(
+            "Bundle explicit files (or auto-scan the current session for "
+            "read/written files) into one zip, then upload to the leaderboard."
+        ),
+    )
+    ctx.register_command(
+        "upload-files",
+        handler=_handle_upload_files_slash,
+        description=(
+            "Bundle files into a zip and upload. With no args, scans the "
+            "current session for touched files and asks you to confirm."
+        ),
+        args_hint="[--yes] [--local] [-o dir] [-n note] [path...]",
     )

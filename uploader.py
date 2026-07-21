@@ -149,6 +149,67 @@ def build_zip(files: List[Path], label: str, name: str, now: Optional[datetime] 
     return zip_path
 
 
+def build_bundle_zip(files: List[Path], name: str, label: str = "files",
+                     note: str = "",
+                     now: Optional[datetime] = None,
+                     out_dir: Optional[Path] = None) -> Path:
+    """Zip an arbitrary list of files (not sessions) for upload.
+
+    Layout inside the zip::
+
+        manifest.json          # {name, created_at, note, files:[{name,size}]}
+        files/<basename>       # each source file, flattened by basename
+
+    Basename collisions get suffixed with ``__<n>``.
+    """
+    now = now or datetime.now()
+    ts = now.strftime("%Y%m%d_%H%M%S")
+    zip_name = f"hermes_files_{_safe(name)}_{_safe(label)}_{ts}.zip"
+
+    if out_dir is None:
+        target_dir = Path(tempfile.mkdtemp(prefix="trace-saver-files-"))
+    else:
+        target_dir = Path(out_dir).expanduser()
+        target_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = target_dir / zip_name
+
+    used_names: dict[str, int] = {}
+    file_entries = []
+
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for f in files:
+            f = Path(f)
+            if not f.exists() or not f.is_file():
+                continue
+            base = f.name or "unnamed"
+            if base in used_names:
+                used_names[base] += 1
+                stem, dot, ext = base.rpartition(".")
+                base = (
+                    f"{stem}__{used_names[base]}.{ext}" if dot else f"{base}__{used_names[base]}"
+                )
+            else:
+                used_names[base] = 0
+            arc = f"files/{base}"
+            zf.write(f, arcname=arc)
+            file_entries.append({
+                "arcname": arc,
+                "source": str(f),
+                "size": f.stat().st_size,
+            })
+
+        manifest = {
+            "kind": "hermes-file-bundle",
+            "board_name": name,
+            "created_at": now.astimezone().isoformat(),
+            "note": note or "",
+            "file_count": len(file_entries),
+            "files": file_entries,
+        }
+        zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+    return zip_path
+
+
 # --------------------------------------------------------------------------- #
 # HTTP: healthz + multipart upload (requests preferred, urllib fallback)
 # --------------------------------------------------------------------------- #
@@ -342,6 +403,74 @@ def save_trace(session: str = "latest", name: Optional[str] = None,
         "user_page": f"{base_url}/u/{name}",
         "message": (
             f"Uploaded {len(files)} trace(s) as '{name}' "
+            f"({size / 1024:.1f} KB). See {base_url}/u/{name}"
+        ),
+    }
+
+
+def upload_files(files: List[Path], name: Optional[str] = None,
+                 note: str = "", label: str = "files",
+                 base_url: Optional[str] = None,
+                 local: bool = False,
+                 out_dir: Optional[str] = None) -> dict:
+    """Bundle an arbitrary file list into a zip and upload it (or keep local).
+
+    Mirrors :func:`save_trace` but for any files the caller supplies,
+    not for Hermes session traces. On the leaderboard it looks like an
+    ordinary upload (+1 point when ``local=False``).
+    """
+    name = (name or default_name()).strip()
+    if not name:
+        raise ValueError("board name is empty; set TRACE_LEADERBOARD_NAME")
+    if not files:
+        raise ValueError("no files to upload")
+
+    resolved = [Path(f) for f in files]
+    missing = [str(f) for f in resolved if not f.exists() or not f.is_file()]
+    if missing:
+        raise FileNotFoundError("file(s) not found: " + ", ".join(missing))
+
+    if local:
+        target_dir = Path(out_dir).expanduser() if out_dir else default_save_dir()
+        zip_path = build_bundle_zip(resolved, name=name, label=label, note=note,
+                                    out_dir=target_dir)
+        size = zip_path.stat().st_size
+        return {
+            "success": True,
+            "mode": "local",
+            "name": name,
+            "files_saved": len(resolved),
+            "zip_bytes": size,
+            "zip_path": str(zip_path),
+            "message": (
+                f"Saved {len(resolved)} file(s) locally as '{name}' "
+                f"({size / 1024:.1f} KB) -> {zip_path}"
+            ),
+        }
+
+    base_url = (base_url or leaderboard_url()).rstrip("/")
+    zip_path = build_bundle_zip(resolved, name=name, label=label, note=note)
+    try:
+        size = zip_path.stat().st_size
+        status = upload_zip(zip_path, name, base_url=base_url)
+    finally:
+        try:
+            zip_path.unlink(missing_ok=True)
+            zip_path.parent.rmdir()
+        except Exception:
+            pass
+
+    return {
+        "success": True,
+        "mode": "upload",
+        "name": name,
+        "files_uploaded": len(resolved),
+        "zip_bytes": size,
+        "http_status": status,
+        "leaderboard": base_url,
+        "user_page": f"{base_url}/u/{name}",
+        "message": (
+            f"Uploaded {len(resolved)} file(s) as '{name}' "
             f"({size / 1024:.1f} KB). See {base_url}/u/{name}"
         ),
     }
