@@ -48,36 +48,62 @@ export TRACE_LEADERBOARD_NAME="张三"
 
 ## 三、在 Hermes 会话里保存 trace
 
-### 方式 A：斜杠命令（你手动触发，最常用）
+**两种模式**:
 
-在 Hermes 的对话框里直接输入：
+| 模式 | 命令 | 是否上传 | 是否 +1 分 |
+|------|------|:--------:|:----------:|
+| 上传(默认) | `/save-trace ...` | ✅ | ✅ |
+| 仅本地 | `/save-trace --local ...` | ❌ | ❌ |
+
+### 方式 A:斜杠命令(你手动触发,最常用)
+
+在 Hermes 的对话框里直接输入:
+
+**上传到排行榜(默认,+1):**
 
 | 命令 | 作用 |
 |------|------|
-| `/save-trace` | 上传**最近一次** session（默认行为，最常用） |
+| `/save-trace` | 上传**最近一次** session(默认行为,最常用) |
 | `/save-trace all` | 把**所有** session 打成一个 zip 上传 |
-| `/save-trace <session-id>` | 上传指定 session（支持 id 或文件名片段匹配） |
-| `/save-trace latest 李四` | 顺便临时改榜上名字（不动 env） |
-| `/save-trace help` | 显示帮助 |
+| `/save-trace <session-id>` | 上传指定 session(支持 id 或文件名片段匹配) |
+| `/save-trace latest 李四` | 顺便临时改榜上名字(不动 env) |
 
-**成功输出**长这样：
+**只本地保存,不上传:**
+
+| 命令 | 作用 |
+|------|------|
+| `/save-trace --local` | 存最近一次 session 到 `~/hermes-traces/`(默认目录) |
+| `/save-trace --local all` | 存所有 session |
+| `/save-trace --local <session-id>` | 存指定 session |
+| `/save-trace --local -o /tmp/xxx` | 存到指定目录(`-o` 会自动开启本地模式) |
+| `/save-trace --local <sess> <name> -o <dir>` | 全参数 |
+
+| 命令 | 作用 |
+|------|------|
+| `/save-trace help` | 显示完整帮助 |
+
+**成功输出**:
 
 ```
 📤 Uploaded 1 trace(s) as '张三' (12.3 KB). See http://10.9.66.12:8848/u/张三
+💾 Saved 1 trace(s) locally as '张三' (12.3 KB) -> /home/you/hermes-traces/hermes_trace_张三_latest_20260721_180000.zip
 ```
 
-**失败输出**会以 `⚠️` 开头，把原因写清楚（比如 leaderboard 连不上、没有 session 文件、名字为空等）。
+上传成功 📤,本地保存 💾。**失败输出**以 `⚠️` 开头,把原因写清楚(leaderboard 连不上、没有 session 文件、名字为空等)。
 
-### 方式 B：让 agent 自己调用
+### 方式 B:让 agent 自己调用
 
-直接跟 agent 说一句：
+直接跟 agent 说一句:
 
-> 把这次 trace 存到排行榜
+> 把这次 trace 存到排行榜(默认会上传)
+> 把这次 trace 只存到本地,不要上传
 
-agent 会调用 `save_trace` 工具做同样的事。参数：
+agent 会调用 `save_trace` 工具。参数:
 
-- `session`（可选）：`latest`（默认）/ `all` / session-id
-- `name`（可选）：榜上名字
+- `session`(可选):`latest`(默认)/ `all` / session-id
+- `name`(可选):榜上/文件名
+- `local`(可选,bool):`true` = 只本地保存,不上传。默认 `false`
+- `out_dir`(可选):`local=true` 时的输出目录,不给则用 `$TRACE_SAVE_DIR` 或 `~/hermes-traces`
 
 ---
 
@@ -99,8 +125,9 @@ agent 会调用 `save_trace` 工具做同样的事。参数：
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `TRACE_LEADERBOARD_NAME` | 系统用户名 | 榜上显示名 |
-| `TRACE_LEADERBOARD_URL` | `http://10.9.66.12:8848` | 排行榜地址（换服务器时改这个） |
-| `HERMES_HOME` | `~/.hermes` | Hermes 主目录，trace 存在其下的 `sessions/` |
+| `TRACE_LEADERBOARD_URL` | `http://10.9.66.12:8848` | 排行榜地址(换服务器时改这个) |
+| `TRACE_SAVE_DIR` | `~/hermes-traces` | `--local` 模式的默认保存目录 |
+| `HERMES_HOME` | `~/.hermes` | Hermes 主目录,trace 存在其下的 `sessions/` |
 
 **只对当前 shell 生效**：直接 `export` 即可。
 **永久生效**：写进 `~/.hermes/.env` 或 shell rc 文件。

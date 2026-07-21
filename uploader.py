@@ -105,16 +105,33 @@ def resolve_sessions(session: str) -> Tuple[List[Path], str]:
 # --------------------------------------------------------------------------- #
 # packaging
 # --------------------------------------------------------------------------- #
-def build_zip(files: List[Path], label: str, name: str, now: Optional[datetime] = None) -> Path:
-    """Zip the given session files into a temp .zip; return its path.
+def default_save_dir() -> Path:
+    """Where local-mode zips are written when the caller doesn't specify a path.
 
-    Adds a small ``manifest.json`` describing what was packaged.
+    ``TRACE_SAVE_DIR`` env var overrides; default ``~/hermes-traces``.
+    """
+    raw = os.environ.get("TRACE_SAVE_DIR", "").strip()
+    return Path(raw).expanduser() if raw else (Path.home() / "hermes-traces")
+
+
+def build_zip(files: List[Path], label: str, name: str, now: Optional[datetime] = None,
+              out_dir: Optional[Path] = None) -> Path:
+    """Zip the given session files into a .zip; return its path.
+
+    Adds a small ``manifest.json`` describing what was packaged. If
+    ``out_dir`` is ``None``, writes to a fresh temp dir (caller must
+    delete). If ``out_dir`` is given, writes there (caller keeps the file).
     """
     now = now or datetime.now()
     ts = now.strftime("%Y%m%d_%H%M%S")
     zip_name = f"hermes_trace_{_safe(name)}_{_safe(label)}_{ts}.zip"
-    tmp_dir = Path(tempfile.mkdtemp(prefix="trace-saver-"))
-    zip_path = tmp_dir / zip_name
+
+    if out_dir is None:
+        target_dir = Path(tempfile.mkdtemp(prefix="trace-saver-"))
+    else:
+        target_dir = Path(out_dir).expanduser()
+        target_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = target_dir / zip_name
 
     manifest = {
         "board_name": name,
@@ -161,13 +178,21 @@ def _healthz(base_url: str, timeout: float = 5.0) -> None:
 
 
 def _upload_requests(base_url: str, name: str, zip_path: Path, timeout: float) -> int:
+    """Login (POST /login) to get the session cookie, then POST /upload with
+    the ``files`` multipart field. The leaderboard reads the name from the
+    signed cookie — the form no longer carries a ``name`` field."""
     import requests  # type: ignore
 
+    s = requests.Session()
+    r = s.post(f"{base_url}/login", data={"name": name}, timeout=timeout,
+               allow_redirects=False)
+    if r.status_code not in (200, 303):
+        raise RuntimeError(f"login failed: HTTP {r.status_code} {r.text[:200]}")
+
     with zip_path.open("rb") as fh:
-        r = requests.post(
+        r = s.post(
             f"{base_url}/upload",
-            data={"name": name},
-            files={"file": (zip_path.name, fh, "application/zip")},
+            files=[("files", (zip_path.name, fh, "application/zip"))],
             timeout=timeout,
             allow_redirects=False,
         )
@@ -177,20 +202,47 @@ def _upload_requests(base_url: str, name: str, zip_path: Path, timeout: float) -
 
 
 def _upload_urllib(base_url: str, name: str, zip_path: Path, timeout: float) -> int:
-    """Zero-dependency multipart/form-data POST."""
+    """Zero-dependency login + multipart upload, cookie carried by CookieJar."""
+    import http.cookiejar
+    import urllib.parse
     import urllib.request
 
+    # --- redirect handler that preserves cookies but never follows redirects ---
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):  # noqa: D401,ANN001
+            return None
+
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(jar), _NoRedirect
+    )
+
+    # ---- 1) login: POST /login with name= (form-urlencoded) ----
+    login_body = urllib.parse.urlencode({"name": name}).encode()
+    login_req = urllib.request.Request(  # noqa: S310
+        f"{base_url}/login",
+        data=login_body,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with opener.open(login_req, timeout=timeout) as resp:  # noqa: S310
+            login_status = resp.status
+    except urllib.error.HTTPError as exc:
+        if exc.code == 303:
+            login_status = 303  # expected success
+        else:
+            raise RuntimeError(f"login failed: HTTP {exc.code} {exc.read()[:200]!r}") from exc
+    if login_status not in (200, 303):
+        raise RuntimeError(f"login failed: HTTP {login_status}")
+
+    # ---- 2) upload: POST /upload with files= multipart ----
     boundary = "----trace-saver-boundary-7MA4YWxkTrZu0gW"
     crlf = b"\r\n"
     body = bytearray()
-
-    body += b"--" + boundary.encode() + crlf
-    body += b'Content-Disposition: form-data; name="name"' + crlf + crlf
-    body += name.encode("utf-8") + crlf
-
     body += b"--" + boundary.encode() + crlf
     body += (
-        b'Content-Disposition: form-data; name="file"; filename="'
+        b'Content-Disposition: form-data; name="files"; filename="'
         + zip_path.name.encode("utf-8")
         + b'"'
         + crlf
@@ -205,17 +257,11 @@ def _upload_urllib(base_url: str, name: str, zip_path: Path, timeout: float) -> 
         method="POST",
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
     )
-    # We must not auto-follow the 303 redirect (it would GET the user page).
-    class _NoRedirect(urllib.request.HTTPRedirectHandler):
-        def redirect_request(self, *a, **k):  # noqa: D401,ANN001
-            return None
-
-    opener = urllib.request.build_opener(_NoRedirect)
     try:
         with opener.open(req, timeout=timeout) as resp:  # noqa: S310
             return resp.status
     except urllib.error.HTTPError as exc:
-        if exc.code == 303:  # redirect = success
+        if exc.code == 303:
             return 303
         raise RuntimeError(f"upload failed: HTTP {exc.code} {exc.read()[:200]!r}") from exc
 
@@ -237,15 +283,41 @@ def upload_zip(zip_path: Path, name: str, base_url: Optional[str] = None,
 # top-level entry point used by the plugin
 # --------------------------------------------------------------------------- #
 def save_trace(session: str = "latest", name: Optional[str] = None,
-               base_url: Optional[str] = None) -> dict:
-    """Resolve → zip → upload. Returns a result dict (never raises for the caller
-    to format; raises only on genuine errors that callers turn into tool_error)."""
+               base_url: Optional[str] = None, local: bool = False,
+               out_dir: Optional[str] = None) -> dict:
+    """Resolve → zip → (upload OR keep locally).
+
+    * ``local=False`` (default) — zip to a temp file, upload to the
+      leaderboard, delete the temp file. Scores +1.
+    * ``local=True`` — zip to ``out_dir`` (or ``$TRACE_SAVE_DIR``, or
+      ``~/hermes-traces``) and stop. Nothing is uploaded, nothing is
+      deleted; the caller can share the .zip however they want.
+    """
     name = (name or default_name()).strip()
     if not name:
         raise ValueError("board name is empty; set TRACE_LEADERBOARD_NAME")
-    base_url = (base_url or leaderboard_url()).rstrip("/")
 
     files, label = resolve_sessions(session)
+
+    if local:
+        target_dir = Path(out_dir).expanduser() if out_dir else default_save_dir()
+        zip_path = build_zip(files, label, name, out_dir=target_dir)
+        size = zip_path.stat().st_size
+        return {
+            "success": True,
+            "mode": "local",
+            "name": name,
+            "selector": label,
+            "sessions_saved": len(files),
+            "zip_bytes": size,
+            "zip_path": str(zip_path),
+            "message": (
+                f"Saved {len(files)} trace(s) locally as '{name}' "
+                f"({size / 1024:.1f} KB) -> {zip_path}"
+            ),
+        }
+
+    base_url = (base_url or leaderboard_url()).rstrip("/")
     zip_path = build_zip(files, label, name)
     try:
         size = zip_path.stat().st_size
@@ -260,6 +332,7 @@ def save_trace(session: str = "latest", name: Optional[str] = None,
 
     return {
         "success": True,
+        "mode": "upload",
         "name": name,
         "selector": label,
         "sessions_uploaded": len(files),
