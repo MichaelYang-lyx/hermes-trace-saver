@@ -21,14 +21,23 @@ curl -fsSL https://raw.githubusercontent.com/MichaelYang-lyx/hermes-trace-saver/
 
 **上传任意文件(input / output 等):**
 ```
-/upload-files a.xlsx b.xlsx    直接把这两个文件打成 zip 上传(+1 分)
 /upload-files                  自动扫本次会话读写过的文件 → 预览
 /upload-files --yes            扫完直接上传(不预览)
-/upload-files --local a.xlsx   只存本地,不上传
-/upload-files -n "本周分析"    加一段备注(写进 zip 的 manifest)
+
+# 一句话微调扫出来的清单(和 --yes 一起用直接上传):
+/upload-files --yes -x big.log            扫,但去掉 big.log
+/upload-files --yes -a extra.csv          扫,再补上 extra.csv
+/upload-files --yes -x *.log -a a.pdf     去 *.log,加 a.pdf
+/upload-files --yes --only *.xlsx         只保留 xlsx 文件
+
+# 手动指定文件(跳过扫描):
+/upload-files a.xlsx b.xlsx               直接把这两个文件打成 zip 上传
+/upload-files --local a.xlsx              只存本地,不上传
 ```
 
-自动扫描会自动跳过 `.env` / `*.key` / SSH 密钥、大于 50MB 的文件、以及 `.git` / `.hermes` / `node_modules` 等目录里的文件。
+模式:`-x` = `--exclude`,`-a` = `--add`,`--only` = 白名单。可重复叠加。匹配规则:完整路径 / 文件名 / 通配符(`*.log`)都行。
+
+自动扫会跳过 `.env` / `*.key` / SSH 密钥、大于 50MB 的文件、以及 `.git` / `.hermes` / `node_modules` 等目录里的文件。
 
 看榜:<http://10.9.66.12:8848>
 

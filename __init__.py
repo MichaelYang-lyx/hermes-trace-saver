@@ -326,71 +326,60 @@ def _handle_upload_files_tool(args: dict, **_kw) -> str:
 _UPLOAD_FILES_HELP = (
     "/upload-files — bundle files into a zip and upload\n"
     "\n"
-    "Explicit files:\n"
-    "  /upload-files a.xlsx b.xlsx           bundle these two files, upload\n"
-    "  /upload-files a.xlsx --local          save the bundle locally, no upload\n"
-    "  /upload-files a.xlsx -n \"weekly\"      attach a note in the zip manifest\n"
+    "Explicit files (skips scan):\n"
+    "  /upload-files a.xlsx b.xlsx           bundle these two, upload\n"
+    "  /upload-files a.xlsx --local          save bundle locally, no upload\n"
     "\n"
-    "Auto-scan current session (preview, then confirm):\n"
-    "  /upload-files                          scan + preview the file list\n"
-    "  /upload-files --yes                    scan + upload without preview\n"
+    "Auto-scan the current session (preview by default):\n"
+    "  /upload-files                          scan + show candidate list\n"
+    "  /upload-files --yes                    scan + upload (no preview)\n"
     "  /upload-files --yes --local            scan + save locally\n"
+    "\n"
+    "One-shot tweaks (works with --yes; refine the auto-scan list in one line):\n"
+    "  --exclude PATTERN / -x PATTERN         drop matching files (repeatable)\n"
+    "  --add PATH        / -a PATH            add an extra file       (repeatable)\n"
+    "  --only PATTERN                         keep only matches       (repeatable)\n"
+    "  PATTERN: exact path, basename, or glob (e.g. *.log)\n"
+    "\n"
+    "Examples:\n"
+    "  /upload-files --yes -x big.log                 upload scan minus big.log\n"
+    "  /upload-files --yes -a extra.csv               upload scan plus extra.csv\n"
+    "  /upload-files --yes -x *.log -a report.pdf     drop *.log, add report.pdf\n"
+    "  /upload-files --yes --only *.xlsx              scan but keep only .xlsx\n"
+    "  /upload-files -n \"weekly analysis\"             attach a note in the manifest\n"
     "\n"
     "Safety filters (always on): drops .env / *.key / *.pem / SSH keys,\n"
     "files > 50 MB, and paths under .hermes / .git / node_modules etc.\n"
 )
 
 
-def _parse_upload_files_args(argv):
-    """Slash arg parser. Returns (paths, name, note, local, out_dir, yes)."""
-    paths, name, note = [], None, ""
-    local, out_dir, yes = False, None, False
-    i = 0
-    while i < len(argv):
-        tok = argv[i]
-        if tok in ("--local", "-l"):
-            local = True
-        elif tok in ("--yes", "-y"):
-            yes = True
-        elif tok in ("--name",):
-            if i + 1 >= len(argv):
-                raise ValueError("--name needs a value")
-            name = argv[i + 1]; i += 1
-        elif tok in ("--note", "-n"):
-            if i + 1 >= len(argv):
-                raise ValueError("-n needs a value")
-            note = argv[i + 1]; i += 1
-        elif tok in ("--out-dir", "--out", "-o"):
-            if i + 1 >= len(argv):
-                raise ValueError(f"{tok} needs a directory")
-            out_dir = argv[i + 1]; local = True; i += 1
-        elif tok.startswith("--out-dir="):
-            out_dir = tok.split("=", 1)[1]; local = True
-        elif tok.startswith("--name="):
-            name = tok.split("=", 1)[1]
-        elif tok.startswith("--note="):
-            note = tok.split("=", 1)[1]
-        elif tok in ("help", "-h", "--help"):
-            return "HELP", None, None, None, None, None
-        else:
-            paths.append(tok)
-        i += 1
-    return paths, name, note, local, out_dir, yes
-
-
 def _handle_upload_files_slash(raw_args: str):
     argv = (raw_args or "").split()
     try:
-        parsed = _parse_upload_files_args(argv)
+        opts = _parse_upload_files_args(argv)
     except ValueError as exc:
         return f"⚠️  {exc}\n\n{_UPLOAD_FILES_HELP}"
-    if parsed[0] == "HELP":
+    if opts.get("help"):
         return _UPLOAD_FILES_HELP
-    paths, name, note, local, out_dir, yes = parsed
+
+    paths   = opts["paths"]
+    name    = opts["name"]
+    note    = opts["note"]
+    local   = opts["local"]
+    out_dir = opts["out_dir"]
+    yes     = opts["yes"]
+    ex_pats = opts["exclude"]
+    add_ps  = opts["add"]
+    only_ps = opts["only"]
 
     try:
         # --- Explicit paths: bypass scan, no preview needed ---
         if paths:
+            if ex_pats or add_ps or only_ps:
+                return (
+                    "⚠️  --exclude / --add / --only only apply to auto-scan mode "
+                    "(you already provided explicit paths).\n\n" + _UPLOAD_FILES_HELP
+                )
             res = _do_upload_files(paths=paths, name=name, note=note,
                                    local=local, out_dir=out_dir)
             icon = "💾" if res.get("mode") == "local" else "📎"
@@ -398,22 +387,29 @@ def _handle_upload_files_slash(raw_args: str):
 
         # --- Auto-scan mode ---
         kept, rejected, session_path = _scan_and_filter()
-        if not kept:
-            body = filepicker.format_preview(kept, rejected,
-                                             session_path=session_path)
+
+        # Apply tweaks (works in both preview and --yes flows)
+        final, changes = _apply_tweaks(kept, ex_pats, add_ps, only_ps)
+
+        if not final:
+            body = _format_tweaked_preview(kept, rejected, changes,
+                                           session_path=session_path)
             return (
-                "⚠️  No eligible files found in the current session.\n\n"
+                "⚠️  No files left to upload after scan + tweaks.\n\n"
                 + body
                 + "\n\nHint: pass explicit paths, e.g. `/upload-files a.xlsx b.xlsx`."
             )
         if not yes:
-            # Preview only. User re-runs with --yes to confirm.
-            return filepicker.format_preview(kept, rejected,
-                                             session_path=session_path)
+            body = _format_tweaked_preview(final, rejected, changes,
+                                           session_path=session_path)
+            return body + (
+                "\n\nTweak flags: --exclude <pat> / --add <path> / --only <pat>. "
+                "Add --yes to upload."
+            )
 
-        # yes → do the upload/save
+        # --yes → actually do it
         res = _do_upload_files(
-            paths=[str(p) for p in kept],
+            paths=[str(p) for p in final],
             name=name, note=note, local=local, out_dir=out_dir,
         )
         icon = "💾" if res.get("mode") == "local" else "📎"
@@ -425,6 +421,171 @@ def _handle_upload_files_slash(raw_args: str):
         return f"⚠️  Leaderboard unreachable: {exc}"
     except Exception as exc:  # noqa: BLE001
         return f"⚠️  upload-files failed: {type(exc).__name__}: {exc}"
+
+
+def _match_pattern(path, pattern: str) -> bool:
+    """True if *pattern* matches this path.
+
+    Matches on (in this order):
+      1. exact full path
+      2. basename equality
+      3. fnmatch of basename (globs: *.log, foo*, ?.csv)
+      4. fnmatch of the full path
+    """
+    import fnmatch
+    from pathlib import Path as _P
+
+    p = _P(path)
+    pat = pattern.strip()
+    if not pat:
+        return False
+    if str(p) == pat or str(p.expanduser().resolve() if p.exists() else p) == pat:
+        return True
+    if p.name == pat:
+        return True
+    if fnmatch.fnmatch(p.name, pat):
+        return True
+    if fnmatch.fnmatch(str(p), pat):
+        return True
+    return False
+
+
+def _apply_tweaks(kept, exclude_patterns, add_paths, only_patterns):
+    """Apply --exclude / --add / --only to the candidate list.
+
+    Returns (final_paths, changes) where changes is a list of
+    (marker, path, reason) for the preview:
+      ' '  kept from scan
+      '-'  removed by --exclude
+      '+'  added by --add (survived safety filters)
+      '✗'  --add candidate that failed safety filters (with reason)
+      ' '  --only trimmed (removed items get a '-' with reason)
+    """
+    from pathlib import Path as _P
+
+    changes = []  # (marker, path, reason_or_empty)
+    final = list(kept)
+
+    # --- --only whitelist (drop anything not matching) ---
+    if only_patterns:
+        matched = []
+        for p in final:
+            if any(_match_pattern(p, pat) for pat in only_patterns):
+                matched.append(p)
+            else:
+                changes.append(("-", p, "--only filter"))
+        final = matched
+
+    # --- --exclude removals ---
+    for pat in exclude_patterns:
+        removed = [p for p in final if _match_pattern(p, pat)]
+        for p in removed:
+            changes.append(("-", p, f"--exclude {pat}"))
+        final = [p for p in final if p not in removed]
+        if not removed:
+            changes.append(("!", _P(pat), f"--exclude {pat} matched nothing"))
+
+    # --- --add additions (run safety filters) ---
+    if add_paths:
+        add_kept, add_rej = filepicker.filter_paths([_P(p) for p in add_paths])
+        existing_resolved = {str(_P(p).expanduser().resolve()) for p in final if _P(p).exists()}
+        for p in add_kept:
+            key = str(p.resolve()) if p.exists() else str(p)
+            if key in existing_resolved:
+                changes.append(("!", p, "--add: already in list"))
+                continue
+            final.append(p)
+            changes.append(("+", p, "--add"))
+        for p, why in add_rej:
+            changes.append(("✗", p, f"--add rejected: {why}"))
+
+    return final, changes
+
+
+def _format_tweaked_preview(kept, rejected, changes, *, session_path=None):
+    """Render preview text showing scan results + explicit tweak markers."""
+    base = filepicker.format_preview(kept, rejected, session_path=session_path)
+    if not changes:
+        return base
+    lines = [base, "", "tweaks:"]
+    for marker, p, reason in changes:
+        lines.append(f"  {marker} {p}  — {reason}")
+    return "\n".join(lines)
+
+
+def _parse_upload_files_args(argv):
+    """Slash arg parser. Returns a dict of parsed options.
+
+    Positional args are treated as explicit file paths (bypasses scan mode).
+    Flags:
+      --yes / -y             confirm auto-scan without preview
+      --local / -l           save the zip locally instead of uploading
+      -o / --out-dir DIR     local output dir (implies --local)
+      --name / -n NAME       leaderboard display name
+      --note NOTE            free-text note (stored in zip manifest)
+      --exclude PATTERN      drop from the scanned candidate list
+                             (repeatable; matches basename, full path,
+                             or fnmatch glob like *.log)
+      --add PATH             add an extra file to the scanned list
+                             (repeatable; still runs safety filters)
+      --only PATTERN         keep ONLY candidates matching this pattern
+                             (repeatable; same matching rules as --exclude)
+    """
+    opts = {
+        "paths": [], "name": None, "note": "",
+        "local": False, "out_dir": None, "yes": False,
+        "exclude": [], "add": [], "only": [],
+    }
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in ("help", "-h", "--help"):
+            opts["help"] = True
+            return opts
+        if tok in ("--local", "-l"):
+            opts["local"] = True
+        elif tok in ("--yes", "-y"):
+            opts["yes"] = True
+        elif tok in ("--name",):
+            if i + 1 >= len(argv):
+                raise ValueError("--name needs a value")
+            opts["name"] = argv[i + 1]; i += 1
+        elif tok == "-n" or tok == "--note":
+            if i + 1 >= len(argv):
+                raise ValueError(f"{tok} needs a value")
+            opts["note"] = argv[i + 1]; i += 1
+        elif tok in ("--out-dir", "--out", "-o"):
+            if i + 1 >= len(argv):
+                raise ValueError(f"{tok} needs a directory")
+            opts["out_dir"] = argv[i + 1]; opts["local"] = True; i += 1
+        elif tok.startswith("--out-dir="):
+            opts["out_dir"] = tok.split("=", 1)[1]; opts["local"] = True
+        elif tok.startswith("--name="):
+            opts["name"] = tok.split("=", 1)[1]
+        elif tok.startswith("--note="):
+            opts["note"] = tok.split("=", 1)[1]
+        elif tok in ("--exclude", "--drop", "-x"):
+            if i + 1 >= len(argv):
+                raise ValueError(f"{tok} needs a pattern")
+            opts["exclude"].append(argv[i + 1]); i += 1
+        elif tok.startswith("--exclude="):
+            opts["exclude"].append(tok.split("=", 1)[1])
+        elif tok in ("--add", "-a"):
+            if i + 1 >= len(argv):
+                raise ValueError(f"{tok} needs a path")
+            opts["add"].append(argv[i + 1]); i += 1
+        elif tok.startswith("--add="):
+            opts["add"].append(tok.split("=", 1)[1])
+        elif tok == "--only":
+            if i + 1 >= len(argv):
+                raise ValueError("--only needs a pattern")
+            opts["only"].append(argv[i + 1]); i += 1
+        elif tok.startswith("--only="):
+            opts["only"].append(tok.split("=", 1)[1])
+        else:
+            opts["paths"].append(tok)
+        i += 1
+    return opts
 
 
 def register(ctx) -> None:
