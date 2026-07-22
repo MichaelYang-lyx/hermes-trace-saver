@@ -42,7 +42,7 @@ echo "==> Installing '$PLUGIN_NAME' into $DEST_DIR"
 mkdir -p "$DEST_DIR"
 
 # Copy plugin sources (exclude scripts/tests, keep it lean).
-for f in plugin.yaml __init__.py uploader.py README.md config.example.env; do
+for f in plugin.yaml __init__.py uploader.py filepicker.py README.md config.example.env; do
   if [ -f "$SRC_DIR/$f" ]; then
     cp -f "$SRC_DIR/$f" "$DEST_DIR/$f"
   fi
