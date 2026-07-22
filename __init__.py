@@ -42,9 +42,10 @@ SAVE_TRACE_SCHEMA = {
     "function": {
         "name": "save_trace",
         "description": (
-            "Package a Hermes session trace into a .zip. By default uploads "
-            "it to the Trace Leaderboard (each upload = +1). Set local=true "
-            "to keep the .zip on disk without uploading."
+            "Package a Hermes session trace PLUS the work files touched this "
+            "session (read/written/terminal) into one .zip and upload it to "
+            "the Trace Leaderboard (+1). Set with_files=false for trace only, "
+            "or local=true to keep the .zip on disk without uploading."
         ),
         "parameters": {
             "type": "object",
@@ -64,6 +65,14 @@ SAVE_TRACE_SCHEMA = {
                         "Leaderboard / archive display name. Defaults to "
                         "$TRACE_LEADERBOARD_NAME or the system user."
                     ),
+                },
+                "with_files": {
+                    "type": "boolean",
+                    "description": (
+                        "Attach the work files this session read/wrote "
+                        "(auto-scanned, safety-filtered). Default true."
+                    ),
+                    "default": True,
                 },
                 "local": {
                     "type": "boolean",
@@ -121,9 +130,20 @@ def _handle_tool(args: dict, **_kw) -> str:
     name = args.get("name")
     local = _coerce_bool(args.get("local", False))
     out_dir = args.get("out_dir") or None
+    with_files = _coerce_bool(args.get("with_files", True))
     try:
-        return tool_result(_do_save(session=session, name=name,
-                                    local=local, out_dir=out_dir))
+        extra = []
+        if with_files:
+            try:
+                scanned, _rej, _sp = _scan_and_filter()
+                extra = [str(p) for p in scanned]
+            except Exception:
+                extra = []  # scanning is best-effort; never blocks the trace
+        res = uploader.save_trace_bundle(
+            session=session, extra_files=extra, name=name,
+            local=local, out_dir=out_dir,
+        )
+        return tool_result(res)
     except (FileNotFoundError, ValueError) as exc:
         return tool_error(str(exc))
     except ConnectionError as exc:
@@ -133,20 +153,35 @@ def _handle_tool(args: dict, **_kw) -> str:
 
 
 _HELP = (
-    "/save-trace — package a Hermes session trace\n"
+    "/save-trace — package the session trace + files touched this session\n"
     "\n"
-    "Upload to leaderboard (default, +1 point each):\n"
-    "  /save-trace                       upload latest session\n"
-    "  /save-trace all                   upload every session in one zip\n"
-    "  /save-trace <session-id>          upload a specific session\n"
-    "  /save-trace latest <name>         override the leaderboard name\n"
+    "By default bundles the Hermes session trace AND the work files the\n"
+    "session read/wrote (input/output/etc.) into ONE zip.\n"
     "\n"
-    "Save locally, do NOT upload:\n"
-    "  /save-trace --local               save latest to $TRACE_SAVE_DIR (~/hermes-traces)\n"
-    "  /save-trace --local all           save all sessions locally\n"
-    "  /save-trace --local <session-id>  save one session locally\n"
-    "  /save-trace --local -o <dir>      write to a specific directory\n"
-    "  /save-trace --local <sess> <name> -o <dir>  full form\n"
+    "Preview vs upload:\n"
+    "  /save-trace                       scan + PREVIEW (trace + which files)\n"
+    "  /save-trace --yes                 upload it all to the leaderboard (+1)\n"
+    "  /save-trace --yes --local         save the zip locally, don't upload\n"
+    "\n"
+    "Pick session / name:\n"
+    "  /save-trace --yes all             every session in the zip\n"
+    "  /save-trace --yes <session-id>    a specific session\n"
+    "  /save-trace --yes --name <name>   override the leaderboard name\n"
+    "\n"
+    "Trace only, no work files:\n"
+    "  /save-trace --yes --no-files\n"
+    "\n"
+    "Tweak the attached file list (one-shot, repeatable):\n"
+    "  --exclude PAT / -x PAT            drop matching files (basename or glob)\n"
+    "  --add PATH   / -a PATH            add an extra file (runs safety filters)\n"
+    "  --only PAT                        keep only matching files\n"
+    "  /save-trace --yes -x *.log -a report.pdf\n"
+    "\n"
+    "Local output dir:\n"
+    "  /save-trace --yes --local -o <dir>\n"
+    "\n"
+    "Safety filters on attached files: drops .env / *.key / *.pem / SSH keys,\n"
+    "files > 50 MB, and paths under .hermes / .git / node_modules etc.\n"
     "\n"
     f"  board:    {uploader.leaderboard_url()}\n"
     f"  name:     {uploader.default_name()}\n"
@@ -155,52 +190,175 @@ _HELP = (
 
 
 def _parse_slash_args(argv):
-    """Parse the slash-command tail into (session, name, local, out_dir).
+    """Parse the /save-trace tail into an options dict.
 
-    Positional order: [session] [name].  Flags may appear anywhere:
-        --local / -l        set local=True
-        --out-dir / -o DIR  set out_dir (implies --local when given)
+    Positional order: [session] [name]. Flags may appear anywhere:
+      --yes / -y             confirm & upload (no preview)
+      --local / -l           save locally instead of uploading
+      -o / --out-dir DIR     local dir (implies --local)
+      --name NAME            leaderboard name (also accepted positionally)
+      --note / -n NOTE       note stored in the zip manifest
+      --no-files             trace only; skip the work-file scan
+      --exclude / -x PAT     drop scanned files (repeatable)
+      --add / -a PATH        add an extra file (repeatable)
+      --only PAT             whitelist scanned files (repeatable)
     """
-    local = False
-    out_dir = None
+    opts = {
+        "session": None, "name": None, "note": "", "yes": False,
+        "local": False, "out_dir": None, "no_files": False,
+        "exclude": [], "add": [], "only": [], "help": False,
+    }
     positionals = []
     i = 0
     while i < len(argv):
         tok = argv[i]
-        if tok in ("--local", "-l"):
-            local = True
+        if tok in ("help", "-h", "--help"):
+            opts["help"] = True
+            return opts
+        elif tok in ("--yes", "-y"):
+            opts["yes"] = True
+        elif tok in ("--local", "-l"):
+            opts["local"] = True
+        elif tok in ("--no-files", "--trace-only"):
+            opts["no_files"] = True
         elif tok in ("--out-dir", "--out", "-o"):
             if i + 1 >= len(argv):
-                raise ValueError(f"{tok} needs a directory argument")
-            out_dir = argv[i + 1]
-            local = True  # -o implies local mode
-            i += 1
+                raise ValueError(f"{tok} needs a directory")
+            opts["out_dir"] = argv[i + 1]; opts["local"] = True; i += 1
         elif tok.startswith("--out-dir="):
-            out_dir = tok.split("=", 1)[1]
-            local = True
+            opts["out_dir"] = tok.split("=", 1)[1]; opts["local"] = True
+        elif tok == "--name":
+            if i + 1 >= len(argv):
+                raise ValueError("--name needs a value")
+            opts["name"] = argv[i + 1]; i += 1
+        elif tok.startswith("--name="):
+            opts["name"] = tok.split("=", 1)[1]
+        elif tok in ("--note", "-n"):
+            if i + 1 >= len(argv):
+                raise ValueError(f"{tok} needs a value")
+            opts["note"] = argv[i + 1]; i += 1
+        elif tok.startswith("--note="):
+            opts["note"] = tok.split("=", 1)[1]
+        elif tok in ("--exclude", "--drop", "-x"):
+            if i + 1 >= len(argv):
+                raise ValueError(f"{tok} needs a pattern")
+            opts["exclude"].append(argv[i + 1]); i += 1
+        elif tok.startswith("--exclude="):
+            opts["exclude"].append(tok.split("=", 1)[1])
+        elif tok in ("--add", "-a"):
+            if i + 1 >= len(argv):
+                raise ValueError(f"{tok} needs a path")
+            opts["add"].append(argv[i + 1]); i += 1
+        elif tok.startswith("--add="):
+            opts["add"].append(tok.split("=", 1)[1])
+        elif tok == "--only":
+            if i + 1 >= len(argv):
+                raise ValueError("--only needs a pattern")
+            opts["only"].append(argv[i + 1]); i += 1
+        elif tok.startswith("--only="):
+            opts["only"].append(tok.split("=", 1)[1])
         else:
             positionals.append(tok)
         i += 1
 
-    session = positionals[0] if len(positionals) >= 1 else "latest"
-    name = positionals[1] if len(positionals) >= 2 else None
-    return session, name, local, out_dir
+    opts["session"] = positionals[0] if len(positionals) >= 1 else "latest"
+    if opts["name"] is None and len(positionals) >= 2:
+        opts["name"] = positionals[1]
+    return opts
+
+
+def _format_bundle_preview(session_label, session_path, kept, rejected, changes):
+    """Preview text for the merged /save-trace: shows the trace + attached files."""
+    lines = []
+    if session_path is not None:
+        lines.append(f"session trace: {session_path.name}  (selector: {session_label})")
+    else:
+        lines.append(f"session trace: {session_label}")
+    total = sum(_safe_stat(p) for p in kept)
+    lines.append(f"attach files : {len(kept)} file(s), ~{total/1024:.1f} KB")
+    for p in kept:
+        lines.append(f"  ✓ {p}  ({_safe_stat(p)} B)")
+    if rejected:
+        lines.append(f"skipped      : {len(rejected)} file(s)")
+        for p, why in rejected[:20]:
+            lines.append(f"  ✗ {p}  — {why}")
+        if len(rejected) > 20:
+            lines.append(f"  ... and {len(rejected)-20} more")
+    if changes:
+        lines.append("tweaks:")
+        for marker, p, reason in changes:
+            lines.append(f"  {marker} {p}  — {reason}")
+    lines.append("")
+    lines.append("Add --yes to upload  (or --yes --local to save the zip locally).")
+    lines.append("Tweak: -x <pat> drop / -a <path> add / --only <pat> / --no-files.")
+    return "\n".join(lines)
+
+
+def _safe_stat(p):
+    try:
+        from pathlib import Path as _P
+        return _P(p).stat().st_size
+    except OSError:
+        return 0
 
 
 def _handle_slash(raw_args: str):
     argv = (raw_args or "").split()
-    if argv and argv[0] in ("help", "-h", "--help"):
-        return _HELP
-
     try:
-        session, name, local, out_dir = _parse_slash_args(argv)
+        opts = _parse_slash_args(argv)
     except ValueError as exc:
         return f"⚠️  {exc}\n\n{_HELP}"
+    if opts["help"]:
+        return _HELP
+
+    session = opts["session"]
+    name = opts["name"]
+    note = opts["note"]
+    yes = opts["yes"]
+    local = opts["local"]
+    out_dir = opts["out_dir"]
 
     try:
-        res = _do_save(session=session, name=name, local=local, out_dir=out_dir)
+        # --- Gather attached work files (unless --no-files) ---
+        kept, rejected, changes, session_path, session_label = [], [], [], None, session
+        if not opts["no_files"]:
+            scanned, rejected, session_path = _scan_and_filter()
+            kept, changes = _apply_tweaks(scanned, opts["exclude"],
+                                          opts["add"], opts["only"])
+            # figure out the human label for the session being saved
+            try:
+                _sf, session_label = uploader.resolve_sessions(session)
+                if _sf:
+                    session_path = _sf[0]
+            except Exception:
+                pass
+
+        # --- Preview mode (no --yes) ---
+        if not yes:
+            if opts["no_files"]:
+                # trace-only preview
+                try:
+                    sf, lbl = uploader.resolve_sessions(session)
+                    sp = sf[0] if sf else None
+                except Exception as exc:
+                    return f"⚠️  {exc}"
+                return (
+                    f"session trace: {sp.name if sp else lbl}  (selector: {lbl})\n"
+                    f"attach files : none (--no-files)\n\n"
+                    "Add --yes to upload  (or --yes --local to save locally)."
+                )
+            return _format_bundle_preview(session_label, session_path,
+                                          kept, rejected, changes)
+
+        # --- Upload / save (--yes) ---
+        extra = [str(p) for p in kept]
+        res = uploader.save_trace_bundle(
+            session=session, extra_files=extra, name=name, note=note,
+            local=local, out_dir=out_dir,
+        )
         icon = "💾" if res.get("mode") == "local" else "📤"
         return f"{icon} {res['message']}"
+
     except (FileNotFoundError, ValueError) as exc:
         return f"⚠️  {exc}"
     except ConnectionError as exc:
@@ -598,19 +756,23 @@ def register(ctx) -> None:
         check_fn=_check_available,
         emoji="📤",
         description=(
-            "Zip a Hermes session trace. Uploads to the Trace Leaderboard "
-            "by default; set local=true to keep the .zip locally instead."
+            "Zip the Hermes session trace + files touched this session and "
+            "upload to the leaderboard (+1). with_files=false for trace only; "
+            "local=true to keep the .zip on disk."
         ),
     )
     ctx.register_command(
         "save-trace",
         handler=_handle_slash,
         description=(
-            "Zip a Hermes session trace. Uploads to the leaderboard (+1) "
-            "by default; --local keeps it on disk without uploading."
+            "Bundle the session trace + files touched this session into one "
+            "zip. No args = preview; --yes uploads (+1); --local saves locally."
         ),
-        args_hint="[--local] [latest|all|<id>] [name] [-o dir]",
+        args_hint="[--yes] [--local] [--no-files] [-x pat] [-a path] [name]",
     )
+    # Agent-only helper: bundle arbitrary/explicit files WITHOUT the trace.
+    # (The /upload-files slash command was merged into /save-trace; this tool
+    # stays for the pure-files case an agent may still want.)
     ctx.register_tool(
         name="upload_files",
         toolset="trace",
@@ -620,15 +782,7 @@ def register(ctx) -> None:
         emoji="📎",
         description=(
             "Bundle explicit files (or auto-scan the current session for "
-            "read/written files) into one zip, then upload to the leaderboard."
+            "read/written files) into one zip WITHOUT the session trace, "
+            "then upload to the leaderboard."
         ),
-    )
-    ctx.register_command(
-        "upload-files",
-        handler=_handle_upload_files_slash,
-        description=(
-            "Bundle files into a zip and upload. With no args, scans the "
-            "current session for touched files and asks you to confirm."
-        ),
-        args_hint="[--yes] [--local] [-o dir] [-n note] [path...]",
     )

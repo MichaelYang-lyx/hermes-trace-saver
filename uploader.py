@@ -210,6 +210,70 @@ def build_bundle_zip(files: List[Path], name: str, label: str = "files",
     return zip_path
 
 
+def build_combined_zip(session_files: List[Path], extra_files: List[Path],
+                       name: str, label: str = "latest", note: str = "",
+                       now: Optional[datetime] = None,
+                       out_dir: Optional[Path] = None) -> Path:
+    """Zip session trace(s) AND arbitrary work files into one archive.
+
+    Layout::
+
+        manifest.json
+        sessions/<name>.json    # the Hermes session trace(s)
+        files/<basename>        # work files (input/output/etc.)
+
+    Used by the merged /save-trace which bundles the trace together with
+    files touched during the session.
+    """
+    now = now or datetime.now()
+    ts = now.strftime("%Y%m%d_%H%M%S")
+    zip_name = f"hermes_trace_{_safe(name)}_{_safe(label)}_{ts}.zip"
+
+    if out_dir is None:
+        target_dir = Path(tempfile.mkdtemp(prefix="trace-saver-combined-"))
+    else:
+        target_dir = Path(out_dir).expanduser()
+        target_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = target_dir / zip_name
+
+    used: dict[str, int] = {}
+    file_entries = []
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for f in session_files:
+            f = Path(f)
+            if f.exists():
+                zf.write(f, arcname=f"sessions/{f.name}")
+        for f in extra_files:
+            f = Path(f)
+            if not f.exists() or not f.is_file():
+                continue
+            base = f.name or "unnamed"
+            if base in used:
+                used[base] += 1
+                stem, dot, ext = base.rpartition(".")
+                base = f"{stem}__{used[base]}.{ext}" if dot else f"{base}__{used[base]}"
+            else:
+                used[base] = 0
+            arc = f"files/{base}"
+            zf.write(f, arcname=arc)
+            file_entries.append({"arcname": arc, "source": str(f),
+                                 "size": f.stat().st_size})
+
+        manifest = {
+            "kind": "hermes-trace+files",
+            "board_name": name,
+            "selector": label,
+            "created_at": now.astimezone().isoformat(),
+            "note": note or "",
+            "session_count": len([f for f in session_files if Path(f).exists()]),
+            "sessions": [Path(f).name for f in session_files if Path(f).exists()],
+            "file_count": len(file_entries),
+            "files": file_entries,
+        }
+        zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+    return zip_path
+
+
 # --------------------------------------------------------------------------- #
 # HTTP: healthz + multipart upload (requests preferred, urllib fallback)
 # --------------------------------------------------------------------------- #
@@ -471,6 +535,62 @@ def upload_files(files: List[Path], name: Optional[str] = None,
         "user_page": f"{base_url}/u/{name}",
         "message": (
             f"Uploaded {len(resolved)} file(s) as '{name}' "
+            f"({size / 1024:.1f} KB). See {base_url}/u/{name}"
+        ),
+    }
+
+
+def save_trace_bundle(session: str = "latest", extra_files: Optional[List[Path]] = None,
+                      name: Optional[str] = None, note: str = "",
+                      base_url: Optional[str] = None,
+                      local: bool = False, out_dir: Optional[str] = None) -> dict:
+    """Bundle session trace(s) + work files into one zip, then upload or save.
+
+    This is the backend for the merged ``/save-trace``. ``extra_files`` is the
+    already-filtered list of work files to include (may be empty).
+    """
+    name = (name or default_name()).strip()
+    if not name:
+        raise ValueError("board name is empty; set TRACE_LEADERBOARD_NAME")
+    extra_files = [Path(f) for f in (extra_files or [])]
+
+    session_files, label = resolve_sessions(session)
+
+    if local:
+        target_dir = Path(out_dir).expanduser() if out_dir else default_save_dir()
+        zip_path = build_combined_zip(session_files, extra_files, name=name,
+                                      label=label, note=note, out_dir=target_dir)
+        size = zip_path.stat().st_size
+        return {
+            "success": True, "mode": "local", "name": name, "selector": label,
+            "sessions_saved": len(session_files), "files_saved": len(extra_files),
+            "zip_bytes": size, "zip_path": str(zip_path),
+            "message": (
+                f"Saved trace + {len(extra_files)} file(s) locally as '{name}' "
+                f"({size / 1024:.1f} KB) -> {zip_path}"
+            ),
+        }
+
+    base_url = (base_url or leaderboard_url()).rstrip("/")
+    zip_path = build_combined_zip(session_files, extra_files, name=name,
+                                  label=label, note=note)
+    try:
+        size = zip_path.stat().st_size
+        status = upload_zip(zip_path, name, base_url=base_url)
+    finally:
+        try:
+            zip_path.unlink(missing_ok=True)
+            zip_path.parent.rmdir()
+        except Exception:
+            pass
+
+    return {
+        "success": True, "mode": "upload", "name": name, "selector": label,
+        "sessions_uploaded": len(session_files), "files_uploaded": len(extra_files),
+        "zip_bytes": size, "http_status": status, "leaderboard": base_url,
+        "user_page": f"{base_url}/u/{name}",
+        "message": (
+            f"Uploaded trace + {len(extra_files)} file(s) as '{name}' "
             f"({size / 1024:.1f} KB). See {base_url}/u/{name}"
         ),
     }

@@ -10,34 +10,26 @@ curl -fsSL https://raw.githubusercontent.com/MichaelYang-lyx/hermes-trace-saver/
 
 ## 用
 
-在 Hermes 会话里输入:
+在 Hermes 会话里输入 `/save-trace` —— 它会把**本次会话的 trace + 会话里读写过的文件**一起打包上传。
 
-**上传会话 trace(Hermes session):**
 ```
-/save-trace                    上传最近一次 session 到排行榜(+1 分)
-/save-trace all                上传所有 session
-/save-trace --local            只存本地,不上传 → ~/hermes-traces/
-```
-
-**上传任意文件(input / output 等):**
-```
-/upload-files                  自动扫本次会话读写过的文件 → 预览
-/upload-files --yes            扫完直接上传(不预览)
-
-# 一句话微调扫出来的清单(和 --yes 一起用直接上传):
-/upload-files --yes -x big.log            扫,但去掉 big.log
-/upload-files --yes -a extra.csv          扫,再补上 extra.csv
-/upload-files --yes -x *.log -a a.pdf     去 *.log,加 a.pdf
-/upload-files --yes --only *.xlsx         只保留 xlsx 文件
-
-# 手动指定文件(跳过扫描):
-/upload-files a.xlsx b.xlsx               直接把这两个文件打成 zip 上传
-/upload-files --local a.xlsx              只存本地,不上传
+/save-trace              先预览:会传哪个 trace + 附带哪些文件
+/save-trace --yes        确认,直接上传到排行榜(+1 分)
+/save-trace --yes --local   只存本地,不上传 → ~/hermes-traces/
 ```
 
-模式:`-x` = `--exclude`,`-a` = `--add`,`--only` = 白名单。可重复叠加。匹配规则:完整路径 / 文件名 / 通配符(`*.log`)都行。
+**微调附带的文件(可选,和 --yes 一起用):**
+```
+/save-trace --yes -x debug.log        去掉某个文件
+/save-trace --yes -a extra.csv        再补一个文件
+/save-trace --yes -x *.log -a a.pdf   去 *.log,加 a.pdf
+/save-trace --yes --only *.xlsx       只保留 xlsx
+/save-trace --yes --no-files          只传 trace,不带文件
+```
 
-自动扫会跳过 `.env` / `*.key` / SSH 密钥、大于 50MB 的文件、以及 `.git` / `.hermes` / `node_modules` 等目录里的文件。
+- `-x`=排除,`-a`=补充,`--only`=白名单。匹配文件名 / 完整路径 / 通配符(`*.log`)。
+- 自动跳过 `.env` / `*.key` / SSH 密钥、大于 50MB 的文件、`.git` / `.hermes` / `node_modules` 等目录。
+- 选别的 session:`/save-trace --yes all`(全部)或 `/save-trace --yes <session-id>`。
 
 看榜:<http://10.9.66.12:8848>
 
