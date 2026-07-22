@@ -196,6 +196,10 @@ def scan_session(session_path: Optional[Path] = None) -> List[str]:
     entries.
     """
     if session_path is None:
+        # Prefer the live session (HERMES_SESSION_ID) over newest-by-mtime, so
+        # we scan the CURRENT conversation's files, not an older one's.
+        session_path = uploader.current_session_file()
+    if session_path is None:
         sessions = uploader.list_sessions()
         if not sessions:
             raise FileNotFoundError(

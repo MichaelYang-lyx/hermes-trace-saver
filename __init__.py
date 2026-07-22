@@ -270,8 +270,16 @@ def _parse_slash_args(argv):
 def _format_bundle_preview(session_label, session_path, kept, rejected, changes):
     """Preview text for the merged /save-trace: shows the trace + attached files."""
     lines = []
+    # Tell the user whether we pinned the LIVE session or fell back to newest.
+    cur = uploader.current_session_file()
     if session_path is not None:
-        lines.append(f"session trace: {session_path.name}  (selector: {session_label})")
+        tag = "当前会话" if (cur is not None and cur == session_path) else "按最近修改时间猜测"
+        lines.append(f"session trace: {session_path.name}  [{tag}]")
+        if cur is None:
+            lines.append(
+                "  ⚠️  未检测到 HERMES_SESSION_ID，无法确认当前会话；"
+                "如选错请用 /save-trace --yes <session-id> 指定。"
+            )
     else:
         lines.append(f"session trace: {session_label}")
     total = sum(_safe_stat(p) for p in kept)

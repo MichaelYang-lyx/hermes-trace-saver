@@ -71,11 +71,44 @@ def list_sessions() -> List[Path]:
     return files
 
 
+def current_session_file() -> Optional[Path]:
+    """Return the file for the CURRENTLY RUNNING Hermes session, if known.
+
+    Hermes sets ``HERMES_SESSION_ID`` (and, in TUI mode,
+    ``HERMES_TUI_ACTIVE_SESSION_FILE``) for the live session. Session files
+    are named ``session_<session_id>.json``, so we can pin the current
+    session instead of guessing by mtime — the running session's file is
+    often NOT the newest on disk (it may not be flushed yet, or an older
+    just-closed session got written more recently).
+
+    Returns None when neither hint is set or the file isn't on disk yet.
+    """
+    # 1) explicit active-session file path (most reliable)
+    active = os.environ.get("HERMES_TUI_ACTIVE_SESSION_FILE", "").strip()
+    if active:
+        p = Path(active).expanduser()
+        if p.is_file():
+            return p
+
+    # 2) match session_<id>.json by the live session id
+    sid = os.environ.get("HERMES_SESSION_ID", "").strip()
+    if sid:
+        exact = sessions_dir() / f"session_{sid}.json"
+        if exact.is_file():
+            return exact
+        # fall back to substring match (id may be a prefix/suffix of the name)
+        for p in list_sessions():
+            if sid in p.name:
+                return p
+    return None
+
+
 def resolve_sessions(session: str) -> Tuple[List[Path], str]:
     """Resolve the ``session`` selector to a list of files + a label for the zip name.
 
     ``session`` accepts:
-      * ``"latest"`` / empty  – most recently modified session
+      * ``"latest"`` / empty  – the CURRENT running session if identifiable
+        (via ``HERMES_SESSION_ID``), otherwise the most recently modified one
       * ``"all"``             – every session file
       * a session id or filename substring – matched against filenames
     """
@@ -89,7 +122,11 @@ def resolve_sessions(session: str) -> Tuple[List[Path], str]:
     if session in ("all", "*"):
         return all_files, "all"
 
-    if session in ("latest", "", "last"):
+    if session in ("latest", "", "last", "current"):
+        cur = current_session_file()
+        if cur is not None:
+            return [cur], _safe(cur.stem, "current")
+        # no live-session hint → best-effort newest by mtime
         return [all_files[0]], _safe(all_files[0].stem, "latest")
 
     # match by id / substring against filename
