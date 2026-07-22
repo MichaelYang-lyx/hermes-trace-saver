@@ -32,17 +32,29 @@ bash uninstall.sh
 
 ## 用法
 
-会话里用斜杠命令：
+会话里用斜杠命令。`/save-trace` 会把**本次会话的 trace + 会话里读/写过的文件**打成一个 zip 一起处理：
 
 ```
-/save-trace                 # 上传最近一次 session（默认）
-/save-trace all             # 所有 session 打进一个 zip
-/save-trace <session-id>    # 指定某个 session（id 或文件名片段）
-/save-trace latest 张三      # 顺便指定榜上名字
-/save-trace help            # 帮助
+/save-trace                 # 先预览：会传哪个 trace + 附带哪些文件（不上传）
+/save-trace --yes           # 确认，上传到排行榜（+1 分）
+/save-trace --yes --local   # 只存本地，不上传 → ~/hermes-traces/
 ```
 
-或者让 agent 直接调用工具 **`save_trace`**（参数 `session` / `name`，都可选）。
+微调附带的文件（和 `--yes` 一起用）：
+
+```
+/save-trace --yes -x debug.log      # 去掉某个文件
+/save-trace --yes -a extra.csv      # 再补一个文件
+/save-trace --yes --only *.xlsx     # 只保留 xlsx
+/save-trace --yes --no-files        # 只传 trace，不带文件
+/save-trace --yes all               # 打包所有 session
+/save-trace --yes --name 张三        # 临时改榜上名字
+/save-trace help                    # 完整帮助
+```
+
+自动跳过 `.env` / `*.key` / SSH 密钥、大于 50MB 的文件、`.git` / `.hermes` / `node_modules` 等目录。
+
+或者让 agent 直接调用工具 **`save_trace`**（参数 `session` / `name` / `with_files` / `local`，都可选）。
 
 成功后返回榜上用户页，例如 `http://10.9.66.12:8848/u/<你的名字>`。
 
@@ -52,6 +64,7 @@ bash uninstall.sh
 |------|--------|------|
 | `TRACE_LEADERBOARD_NAME` | 系统用户名 | 榜上显示名 |
 | `TRACE_LEADERBOARD_URL`  | `http://10.9.66.12:8848` | 排行榜地址 |
+| `TRACE_SAVE_DIR` | `~/hermes-traces` | `--local` 模式的保存目录 |
 | `HERMES_HOME` | `~/.hermes` | Hermes 主目录（trace 在 `sessions/` 下） |
 
 设置示例：
@@ -65,8 +78,9 @@ export TRACE_LEADERBOARD_NAME="your-name"
 ## trace 是什么
 
 Hermes 每个会话存成 `~/.hermes/sessions/session_*.json`（含 model / tools /
-完整 messages 轨迹）。本插件把选中的 session 文件加一个 `manifest.json`
-一起压成 zip 上传。
+完整 messages 轨迹）。`/save-trace` 把选中的 session 文件放进 `sessions/`，
+并自动扫描本次会话读/写过的工作文件放进 `files/`，加一个 `manifest.json`
+一起压成 zip（`--no-files` 可只保留 trace）。
 
 ## 依赖
 
@@ -78,8 +92,9 @@ Hermes 每个会话存成 `~/.hermes/sessions/session_*.json`（含 model / tool
 ```
 trace-saver/
 ├── plugin.yaml          # 插件清单
-├── __init__.py          # register(ctx)：注册 save_trace 工具 + /save-trace 命令
-├── uploader.py          # 纯逻辑：找 session → 打 zip → 上传
+├── __init__.py          # register(ctx)：注册 save_trace / upload_files 工具 + /save-trace 命令
+├── uploader.py          # 找 session → 打 zip → 登录 → 上传
+├── filepicker.py        # 扫描会话、过滤文件、生成预览
 ├── install.sh           # 一键安装
 ├── uninstall.sh         # 一键卸载
 ├── config.example.env   # 环境变量样例
