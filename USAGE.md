@@ -107,6 +107,55 @@ agent 会调用 `save_trace` 工具。参数:
 
 ---
 
+## 三点五、上传任意文件(input / output 等)
+
+`/save-trace` 传的是 Hermes 的会话记录。如果你想传**具体的工作文件**(比如分析用的 `input.xlsx` 和你产出的 `output.xlsx`),用 `/upload-files`。
+
+### 自动扫描(推荐)
+
+自动找出**本次会话里读/写过、且现在磁盘上还在**的文件:
+
+```
+/upload-files          先扫描并列出会传哪些(预览,不上传)
+/upload-files --yes    确认后直接上传(+1 分)
+```
+
+预览会列出 ✓ 保留的 和 ✗ 跳过的(带原因)。**自动跳过**:`.env` / `*.key` / `*.pem` / SSH 密钥,大于 50MB 的文件,以及 `.git` / `.hermes` / `.claude` / `node_modules` 等目录里的文件。
+
+### 一句话微调扫出来的清单
+
+不用先存文件再改,直接在同一句里增删(和 `--yes` 一起用就直接上传):
+
+| 指令 | 作用 |
+|------|------|
+| `/upload-files --yes -x debug.log` | 扫,但去掉 `debug.log` |
+| `/upload-files --yes -a extra.csv` | 扫,再补上 `extra.csv` |
+| `/upload-files --yes -x *.log -a a.pdf` | 去掉所有 `*.log`,加上 `a.pdf` |
+| `/upload-files --yes --only *.xlsx` | 只保留 `.xlsx` 文件 |
+
+- `-x` = `--exclude`(排除),`-a` = `--add`(补充),`--only`(白名单)。都可重复叠加。
+- 匹配规则:完整路径 / 文件名 / 通配符(`*.log`)都行。
+- `--add` 的文件同样过安全检查;被挡下会以 `✗` + 原因显示。
+- 微调结果用 `+` / `-` / `✗` / `!` 标记,一眼看清每步改了什么。
+
+### 手动指定文件(跳过扫描)
+
+```
+/upload-files a.xlsx b.xlsx        直接把这两个文件打成一个 zip 上传
+/upload-files --local a.xlsx       只存本地,不上传
+/upload-files a.xlsx -n "本周分析"  加一段备注(写进 zip 的 manifest.json)
+```
+
+### 让 agent 自己调用
+
+直接说:
+
+> 把这次用到的 input 和 output 文件都传到排行榜
+
+agent 会调用 `upload_files` 工具。参数:`paths`(数组,留空=自动扫描)、`name`、`note`、`local`、`out_dir`。
+
+---
+
 ## 四、看榜
 
 浏览器打开：
@@ -145,8 +194,9 @@ agent 会调用 `save_trace` 工具。参数:
 ```
 ~/.hermes/plugins/trace-saver/
 ├── plugin.yaml
-├── __init__.py       # 注册 save_trace 工具 + /save-trace 命令
-├── uploader.py       # 打包 + 上传的核心逻辑
+├── __init__.py       # 注册 save_trace / upload_files 工具 + /save-trace /upload-files 命令
+├── uploader.py       # 打包 + 登录 + 上传的核心逻辑
+├── filepicker.py     # 扫描会话、过滤文件、生成预览
 ├── README.md
 ├── config.example.env
 └── uninstall.sh
