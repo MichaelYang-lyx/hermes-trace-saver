@@ -54,6 +54,8 @@ bash uninstall.sh
 
 自动跳过 `.env` / `*.key` / SSH 密钥、大于 50MB 的文件、`.git` / `.hermes` / `node_modules` 等目录。
 
+预览的第一行会标注 `[当前会话]` 或 `[按最近修改时间猜测]`——后者表示没拿到 `HERMES_SESSION_ID`，可能选错，用 `/save-trace --yes <session-id>` 手动指定即可。
+
 或者让 agent 直接调用工具 **`save_trace`**（参数 `session` / `name` / `with_files` / `local`，都可选）。
 
 成功后返回榜上用户页，例如 `http://10.9.66.12:8848/u/<你的名字>`。

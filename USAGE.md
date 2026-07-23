@@ -99,6 +99,27 @@ export TRACE_LEADERBOARD_NAME="张三"
 
 上传 📤,本地 💾。**失败**以 `⚠️` 开头,写清原因(连不上、没有 session、名字为空等)。
 
+**怎么确认选中的是"本次会话"而不是上一次:**
+
+预览的第一行会明确标注:
+
+```
+session trace: session_20260722_120000_xxx.json  [当前会话]
+session trace: session_20260722_120000_xxx.json  [按最近修改时间猜测]
+    ⚠️  未检测到 HERMES_SESSION_ID,无法确认当前会话;
+        如选错请用 /save-trace --yes <session-id> 指定。
+```
+
+- `[当前会话]` = 通过 Hermes 运行时的 `HERMES_SESSION_ID` 精确定位到你**正在进行**的会话。
+- `[按最近修改时间猜测]` = 没拿到 `HERMES_SESSION_ID`,退回选目录里最近修改的那个 —— 可能不是当前会话(比如某个刚结束的会话反而更新)。这种情况建议核对预览里的文件名或用 `-y <session-id>` 手动指定,例如:
+
+  ```
+  /save-trace --yes 20260722_120000
+  ```
+  (session-id 支持文件名子串匹配。)
+
+背景:Hermes 主要把会话存在 `state.db`(SQLite)里,`sessions/*.json` 是定期/结束时才落盘的快照。所以运行中的当前会话对应的 json 可能还没写盘,直接用 mtime 挑就容易选到上一次的旧会话。
+
 ### 方式 B:让 agent 自己调用
 
 直接说:
@@ -169,6 +190,7 @@ agent 会调用 `save_trace` 工具。参数:
 | 现象 | 排查/解决 |
 |------|-----------|
 | 输了 `/save-trace` 没反应 / 提示未知命令 | 你还在**旧会话**里，关掉重开一个 Hermes 会话再试 |
+| **选中的是上一次/很早的会话** | 看预览里的标注：`[当前会话]` 是对的、`[按最近修改时间猜测]` 说明没拿到 `HERMES_SESSION_ID`，退回按 mtime 猜了。用 `/save-trace --yes <session-id>` 精确指定即可 |
 | `⚠️ Leaderboard unreachable: ...` | 当前网络到不了 `10.9.66.12:8848`；或服务挂了。用 `curl http://10.9.66.12:8848/healthz` 测一下 |
 | `⚠️ No Hermes session traces found` | Hermes 还没写过任何 session 文件；先聊几句再存 |
 | 想换到别的服务器 | `export TRACE_LEADERBOARD_URL=http://x.x.x.x:PORT` |
