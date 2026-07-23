@@ -149,13 +149,25 @@ _PATH_ARG_TOOLS = {
     "append_file",
 }
 _TERMINAL_TOOLS = {"terminal", "bash", "shell"}
+# Tools that search/list files. Their ``target`` arg is a directory the
+# search ran under, and their RESULT (in the paired role=tool message)
+# contains the actual matched paths (often ./relative).
+_SEARCH_TOOLS = {"search_files", "glob", "find_files", "list_files", "ls"}
 
 # Absolute or home-relative path token in a terminal command / output.
 _ABS_OR_HOME_PATH_RE = re.compile(r"(?<![\w])(/[^\s'\"`;|&<>()]+|~/[^\s'\"`;|&<>()]+)")
+# ./relative or plain filename-with-extension token — used when scanning
+# search-tool RESULTS where paths often lack a leading slash.
+_REL_PATH_RE = re.compile(r"(?:\./|(?<![\w./]))([\w.\-一-鿿]+\.[A-Za-z0-9]{1,8})")
 
 
-def _paths_from_tool_call(tc: dict) -> List[str]:
-    """Extract candidate file paths from a single assistant tool_call dict."""
+def _paths_from_tool_call(tc: dict) -> Tuple[List[str], Optional[str]]:
+    """Extract candidate file paths + a base directory hint from one tool_call.
+
+    Returns (paths, base_dir). ``base_dir`` is a directory the tool implicitly
+    treats as cwd (e.g. ``search_files``'s ``target``) — used later to resolve
+    relative paths appearing in the tool's RESULT message.
+    """
     fn = tc.get("function") or {}
     name = fn.get("name", "")
     raw = fn.get("arguments") or "{}"
@@ -164,9 +176,11 @@ def _paths_from_tool_call(tc: dict) -> List[str]:
     except (TypeError, ValueError):
         args = {}
     if not isinstance(args, dict):
-        return []
+        return [], None
 
     out: List[str] = []
+    base: Optional[str] = None
+
     if name in _PATH_ARG_TOOLS:
         for key in ("path", "file_path"):
             v = args.get(key)
@@ -174,6 +188,9 @@ def _paths_from_tool_call(tc: dict) -> List[str]:
                 out.append(v.strip())
     elif name in _TERMINAL_TOOLS:
         cmd = args.get("command")
+        cwd = args.get("cwd") or args.get("workdir")
+        if isinstance(cwd, str) and cwd.strip():
+            base = cwd.strip()
         if isinstance(cmd, str):
             # 1) tokenise: catches `cat /path/x.log` even when the path is quoted
             try:
@@ -185,15 +202,94 @@ def _paths_from_tool_call(tc: dict) -> List[str]:
             # 2) regex sweep: catches paths embedded in larger tokens
             for m in _ABS_OR_HOME_PATH_RE.findall(cmd):
                 out.append(m)
-    return out
+    elif name in _SEARCH_TOOLS:
+        # target/dir/path arg may be a search-base directory OR an enum-ish
+        # value like "files"/"directories" (Hermes search_files' target).
+        # Only treat it as a base when it *looks* like a path.
+        for key in ("cwd", "root", "dir", "directory", "path", "target"):
+            v = args.get(key)
+            if isinstance(v, str) and v.strip():
+                s = v.strip()
+                if s.startswith(("/", "~", "./", "../")) or "/" in s:
+                    base = s
+                    break
+    return out, base
+
+
+def _paths_from_tool_result(content, base: Optional[str]) -> List[str]:
+    """Pull file paths out of a role='tool' message's content.
+
+    Handles two shapes seen in Hermes:
+      * JSON: {"files": ["./a.png", "./b.png"], ...}
+      * Plain text listing (find/ls-style output)
+
+    Relative entries (``./x``, ``x.ext``) are resolved against ``base`` when
+    given, so results from ``search_files target=files`` become absolute.
+    """
+    if not content:
+        return []
+    text = content if isinstance(content, str) else str(content)
+    out: List[str] = []
+
+    # Try JSON first — search_files returns {"files": [...]}
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            for key in ("files", "paths", "results", "matches"):
+                v = data.get(key)
+                if isinstance(v, list):
+                    for item in v:
+                        if isinstance(item, str) and item.strip():
+                            out.append(item.strip())
+                        elif isinstance(item, dict):
+                            for k2 in ("path", "file", "name"):
+                                s = item.get(k2)
+                                if isinstance(s, str) and s.strip():
+                                    out.append(s.strip())
+                                    break
+    except (TypeError, ValueError):
+        pass
+
+    # Fall back to plain-text sweep (line-per-path or ./relative tokens)
+    if not out:
+        for line in text.splitlines():
+            ln = line.strip()
+            if not ln:
+                continue
+            if ln.startswith(("/", "~")):
+                out.append(ln)
+            elif ln.startswith("./") or _REL_PATH_RE.search(ln):
+                out.append(ln)
+
+    # Resolve relatives against base dir; fall back to Hermes process cwd
+    # when no explicit base was given by the tool call.
+    from pathlib import Path as _P
+    resolved: List[str] = []
+    base_p = _P(base).expanduser() if base else None
+    if base_p is None:
+        try:
+            base_p = uploader.hermes_cwd()  # /proc-based, best-effort
+        except Exception:
+            base_p = None
+    for p in out:
+        pp = _P(p)
+        if pp.is_absolute() or p.startswith("~"):
+            resolved.append(p)
+        elif base_p is not None:
+            rel = p[2:] if p.startswith("./") else p
+            resolved.append(str(base_p / rel))
+        else:
+            # No cwd hint — leave the raw relative; filter_paths will drop it.
+            resolved.append(p)
+    return resolved
 
 
 def scan_session(session_path: Optional[Path] = None) -> List[str]:
     """Return the list of candidate file paths mentioned in *session_path*.
 
-    Duplicates are collapsed; order roughly follows first appearance. This
-    is the RAW set — caller runs :func:`filter_paths` to drop unsafe/missing
-    entries.
+    Reads BOTH tool_call arguments AND the paired tool RESULT messages, so
+    search/list tools (whose match set only appears in the result) are
+    covered. Duplicates collapsed; order roughly follows first appearance.
     """
     if session_path is None:
         # Prefer the live session (HERMES_SESSION_ID) over newest-by-mtime, so
@@ -212,12 +308,28 @@ def scan_session(session_path: Optional[Path] = None) -> List[str]:
 
     seen: Set[str] = set()
     ordered: List[str] = []
+    # Map tool_call_id → base_dir hint so we can resolve relative paths in the
+    # paired result message.
+    call_bases: dict = {}
+
+    def _remember(paths):
+        for p in paths:
+            if p and p not in seen:
+                seen.add(p)
+                ordered.append(p)
+
     for msg in data.get("messages", []) or []:
-        for tc in (msg.get("tool_calls") or []):
-            for p in _paths_from_tool_call(tc):
-                if p not in seen:
-                    seen.add(p)
-                    ordered.append(p)
+        role = msg.get("role")
+        if role == "assistant":
+            for tc in (msg.get("tool_calls") or []):
+                paths, base = _paths_from_tool_call(tc)
+                _remember(paths)
+                tcid = tc.get("id") or tc.get("call_id")
+                if tcid and base:
+                    call_bases[tcid] = base
+        elif role == "tool":
+            base = call_bases.get(msg.get("tool_call_id"))
+            _remember(_paths_from_tool_result(msg.get("content"), base))
     return ordered
 
 

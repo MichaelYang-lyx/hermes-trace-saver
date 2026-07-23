@@ -80,6 +80,63 @@ def _state_db_path() -> Path:
     return hermes_home() / "state.db"
 
 
+def hermes_cwd() -> Optional[Path]:
+    """Best-effort: return the cwd Hermes' agent processes are running in.
+
+    Hermes doesn't record the tool-call cwd in session json, but the agent
+    almost always runs in the cwd of the ``hermes`` binary process. Read
+    ``/proc/<pid>/cwd`` for every live hermes binary process and pick the
+    deepest one (a working directory is more specific than a wrapper's
+    launch dir). Returns None on non-Linux / no process found.
+
+    We only match processes whose command line runs the ``hermes`` binary
+    itself (typically ``.../venv/bin/hermes``) — NOT arbitrary python
+    scripts that happen to import ``hermes``, since a diagnostic REPL
+    would otherwise beat the real agent.
+    """
+    import glob as _glob
+    import os as _os
+    my_pid = _os.getpid()
+    candidates: List[Path] = []
+    try:
+        for cmd_path in _glob.glob("/proc/*/cmdline"):
+            try:
+                pid = int(cmd_path.split("/")[2])
+            except (IndexError, ValueError):
+                continue
+            if pid == my_pid:  # never count ourselves
+                continue
+            try:
+                with open(cmd_path, "rb") as fh:
+                    raw = fh.read()
+            except OSError:
+                continue
+            argv = [a for a in raw.split(b"\x00") if a]
+            if not argv:
+                continue
+            # A hermes agent process = some argv token whose basename is
+            # exactly ``hermes`` (matches ``/…/venv/bin/hermes`` and bare
+            # ``hermes`` alike, but not python scripts importing hermes).
+            if not any(_os.path.basename(a.decode(errors="replace")) == "hermes"
+                       for a in argv):
+                continue
+            pid_dir = _os.path.dirname(cmd_path)
+            try:
+                cwd = _os.readlink(_os.path.join(pid_dir, "cwd"))
+            except OSError:
+                continue
+            p = Path(cwd)
+            if p.is_dir():
+                candidates.append(p)
+    except Exception:
+        return None
+    if not candidates:
+        return None
+    # Deepest path wins — a working subdir beats /data/project.
+    candidates.sort(key=lambda p: (len(p.parts), str(p)), reverse=True)
+    return candidates[0]
+
+
 def state_db_available() -> bool:
     return _state_db_path().is_file()
 
