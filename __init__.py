@@ -483,11 +483,16 @@ UPLOAD_FILES_SCHEMA = {
 
 
 def _scan_and_filter():
-    """Auto-scan the latest session, return (kept, rejected, session_path)."""
-    session_path = None
-    sessions = uploader.list_sessions()
-    if sessions:
-        session_path = sessions[0]
+    """Auto-scan the CURRENT session, return (kept, rejected, session_path).
+
+    Delegate session discovery to filepicker/uploader (state.db-aware) so
+    we never scan a stale on-disk .json when the live conversation lives
+    in state.db.
+    """
+    # Prefer the live session; fall back to newest-on-disk only if there is
+    # truly nothing else. Passing None lets scan_session() do the right
+    # thing via uploader.current_session_file().
+    session_path = uploader.current_session_file()
     raw = filepicker.scan_session(session_path)
     from pathlib import Path as _P
     kept, rejected = filepicker.filter_paths([_P(p) for p in raw])
