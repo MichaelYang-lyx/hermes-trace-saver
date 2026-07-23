@@ -71,35 +71,203 @@ def list_sessions() -> List[Path]:
     return files
 
 
-def current_session_file() -> Optional[Path]:
-    """Return the file for the CURRENTLY RUNNING Hermes session, if known.
+# --------------------------------------------------------------------------- #
+# state.db — modern Hermes stores conversations directly in SQLite. The
+# sessions/*.json tree is a legacy/export artifact and is often stale, so we
+# read the DB whenever we can.
+# --------------------------------------------------------------------------- #
+def _state_db_path() -> Path:
+    return hermes_home() / "state.db"
 
-    Hermes sets ``HERMES_SESSION_ID`` (and, in TUI mode,
-    ``HERMES_TUI_ACTIVE_SESSION_FILE``) for the live session. Session files
-    are named ``session_<session_id>.json``, so we can pin the current
-    session instead of guessing by mtime — the running session's file is
-    often NOT the newest on disk (it may not be flushed yet, or an older
-    just-closed session got written more recently).
 
-    Returns None when neither hint is set or the file isn't on disk yet.
+def state_db_available() -> bool:
+    return _state_db_path().is_file()
+
+
+def _connect_state_db():
+    """Open state.db read-only (works even while Hermes is writing)."""
+    import sqlite3
+    p = _state_db_path()
+    con = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=5.0)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def list_db_sessions(limit: int = 200) -> List[dict]:
+    """Sessions from state.db, most-recently-active first (by last message).
+
+    Returns dicts with keys: id, source, model, started_at, ended_at,
+    last_msg (unix ts), nmsg.
     """
-    # 1) explicit active-session file path (most reliable)
+    if not state_db_available():
+        return []
+    try:
+        with _connect_state_db() as con:
+            rows = con.execute("""
+                SELECT s.id, s.source, s.model, s.started_at, s.ended_at,
+                       COALESCE(MAX(m.timestamp), s.started_at) AS last_msg,
+                       COUNT(m.id) AS nmsg
+                FROM sessions s
+                LEFT JOIN messages m ON m.session_id = s.id
+                GROUP BY s.id
+                ORDER BY last_msg DESC
+                LIMIT ?""", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def most_recent_db_session_id() -> Optional[str]:
+    """Session id with the most recent message across the DB."""
+    sessions = list_db_sessions(limit=1)
+    return sessions[0]["id"] if sessions else None
+
+
+def export_session_from_db(session_id: str, out_dir: Optional[Path] = None) -> Path:
+    """Read sessions+messages from state.db, write a session_<id>.json file.
+
+    Emits the same top-level shape as the legacy ``sessions/*.json``
+    exports so the rest of the packaging code works unchanged:
+    ``session_id, model, session_start, last_updated, system_prompt,
+    message_count, messages``.
+
+    Only ``active`` messages are exported (compacted/observed rows are
+    metadata Hermes writes for its own tracking).
+    """
+    if not state_db_available():
+        raise FileNotFoundError(f"state.db not found at {_state_db_path()}")
+
+    with _connect_state_db() as con:
+        srow = con.execute(
+            "SELECT * FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if srow is None:
+            raise FileNotFoundError(
+                f"session '{session_id}' not found in state.db"
+            )
+        # `active` may not exist on very old schemas — be defensive.
+        try:
+            mrows = con.execute("""
+                SELECT role, content, tool_call_id, tool_calls, tool_name,
+                       timestamp, finish_reason, reasoning
+                FROM messages
+                WHERE session_id = ?
+                  AND COALESCE(active, 1) = 1
+                ORDER BY id ASC""", (session_id,)).fetchall()
+        except Exception:
+            mrows = con.execute("""
+                SELECT role, content, tool_call_id, tool_calls, tool_name,
+                       timestamp, finish_reason
+                FROM messages
+                WHERE session_id = ?
+                ORDER BY id ASC""", (session_id,)).fetchall()
+
+    def _parse_tool_calls(raw):
+        if not raw:
+            return None
+        if isinstance(raw, (list, dict)):
+            return raw
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            return raw  # keep raw string as fallback
+
+    messages = []
+    last_ts = 0.0
+    for r in mrows:
+        m = {"role": r["role"], "content": r["content"] or ""}
+        tc = _parse_tool_calls(r["tool_calls"])
+        if tc is not None:
+            m["tool_calls"] = tc
+        if r["tool_call_id"]:
+            m["tool_call_id"] = r["tool_call_id"]
+        if r["tool_name"]:
+            m["tool_name"] = r["tool_name"]
+        if r["finish_reason"]:
+            m["finish_reason"] = r["finish_reason"]
+        if r["timestamp"]:
+            m["timestamp"] = r["timestamp"]
+            last_ts = max(last_ts, float(r["timestamp"] or 0))
+        try:
+            if r["reasoning"]:
+                m["reasoning"] = r["reasoning"]
+        except (IndexError, KeyError):
+            pass
+        messages.append(m)
+
+    def _iso(ts):
+        if not ts:
+            return None
+        try:
+            return datetime.fromtimestamp(float(ts)).astimezone().isoformat()
+        except (TypeError, ValueError):
+            return str(ts)
+
+    payload = {
+        "session_id": srow["id"],
+        "model": srow["model"] if "model" in srow.keys() else None,
+        "source": srow["source"] if "source" in srow.keys() else None,
+        "session_start": _iso(srow["started_at"]) if "started_at" in srow.keys() else None,
+        "last_updated": _iso(last_ts) if last_ts else None,
+        "system_prompt": srow["system_prompt"] if "system_prompt" in srow.keys() else None,
+        "exported_from": "state.db",
+        "exported_at": datetime.now().astimezone().isoformat(),
+        "message_count": len(messages),
+        "messages": messages,
+    }
+
+    out_dir = Path(out_dir).expanduser() if out_dir else Path(tempfile.mkdtemp(
+        prefix="trace-saver-dbexport-"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"session_{session_id}.json"
+    out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+    return out_path
+
+
+def current_session_file() -> Optional[Path]:
+    """Return a Path to the CURRENT session as JSON (best effort).
+
+    Priority:
+      1. ``HERMES_TUI_ACTIVE_SESSION_FILE`` env (explicit path on disk).
+      2. ``HERMES_SESSION_ID`` env → export from state.db if possible,
+         else look for a matching ``sessions/session_<id>.json``.
+      3. Most recently active session in ``state.db`` (by last message
+         timestamp) → export to a temp json.
+
+    Returns None when nothing works (no env hint, no DB, no on-disk file).
+    """
+    # 1) explicit active-session file path (most reliable when set)
     active = os.environ.get("HERMES_TUI_ACTIVE_SESSION_FILE", "").strip()
     if active:
         p = Path(active).expanduser()
         if p.is_file():
             return p
 
-    # 2) match session_<id>.json by the live session id
+    # 2) explicit HERMES_SESSION_ID
     sid = os.environ.get("HERMES_SESSION_ID", "").strip()
     if sid:
         exact = sessions_dir() / f"session_{sid}.json"
         if exact.is_file():
             return exact
-        # fall back to substring match (id may be a prefix/suffix of the name)
+        # try exporting from DB
+        if state_db_available():
+            try:
+                return export_session_from_db(sid)
+            except FileNotFoundError:
+                pass
+        # last-ditch: substring match against on-disk files
         for p in list_sessions():
             if sid in p.name:
                 return p
+
+    # 3) no env hint → most-recently-active session from the DB
+    if state_db_available():
+        sid = most_recent_db_session_id()
+        if sid:
+            try:
+                return export_session_from_db(sid)
+            except FileNotFoundError:
+                pass
     return None
 
 
@@ -107,34 +275,65 @@ def resolve_sessions(session: str) -> Tuple[List[Path], str]:
     """Resolve the ``session`` selector to a list of files + a label for the zip name.
 
     ``session`` accepts:
-      * ``"latest"`` / empty  – the CURRENT running session if identifiable
-        (via ``HERMES_SESSION_ID``), otherwise the most recently modified one
-      * ``"all"``             – every session file
-      * a session id or filename substring – matched against filenames
+      * ``"latest"`` / empty  – the CURRENTLY ACTIVE session (via
+        ``HERMES_SESSION_ID`` env or the newest session in ``state.db``)
+      * ``"all"``             – every session (DB if available, else *.json)
+      * a session id or filename substring – matched against DB then filenames
     """
     session = (session or "latest").strip()
-    all_files = list_sessions()
-    if not all_files:
-        raise FileNotFoundError(
-            f"No Hermes session traces found under {sessions_dir()}"
-        )
 
     if session in ("all", "*"):
+        db_sessions = list_db_sessions(limit=1000)
+        if db_sessions:
+            files = []
+            for s in db_sessions:
+                try:
+                    files.append(export_session_from_db(s["id"]))
+                except Exception:
+                    pass
+            if files:
+                return files, "all"
+        # fall back to on-disk *.json
+        all_files = list_sessions()
+        if not all_files:
+            raise FileNotFoundError(
+                f"No Hermes sessions found (state.db empty, {sessions_dir()} empty)"
+            )
         return all_files, "all"
 
     if session in ("latest", "", "last", "current"):
         cur = current_session_file()
         if cur is not None:
             return [cur], _safe(cur.stem, "current")
-        # no live-session hint → best-effort newest by mtime
+        # no DB and no env hint → best-effort newest .json by mtime
+        all_files = list_sessions()
+        if not all_files:
+            raise FileNotFoundError(
+                f"No Hermes sessions found (state.db unavailable, "
+                f"{sessions_dir()} empty)"
+            )
         return [all_files[0]], _safe(all_files[0].stem, "latest")
 
-    # match by id / substring against filename
+    # explicit selector: prefer DB (may include sessions not yet on disk)
+    if state_db_available():
+        db_matches = [s for s in list_db_sessions(limit=1000) if session in s["id"]]
+        if db_matches:
+            files = []
+            for s in db_matches:
+                try:
+                    files.append(export_session_from_db(s["id"]))
+                except Exception:
+                    pass
+            if files:
+                return files, _safe(session)
+
+    # last: substring match against on-disk filenames
+    all_files = list_sessions()
     matches = [p for p in all_files if session in p.name]
     if not matches:
         raise FileNotFoundError(
-            f"No session matching '{session}' under {sessions_dir()} "
-            f"({len(all_files)} sessions available; use 'latest' or 'all')"
+            f"No session matching '{session}' in state.db or "
+            f"{sessions_dir()}. Try `/save-trace list` to see available IDs."
         )
     return matches, _safe(session)
 

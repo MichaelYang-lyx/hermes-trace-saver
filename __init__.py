@@ -270,15 +270,26 @@ def _parse_slash_args(argv):
 def _format_bundle_preview(session_label, session_path, kept, rejected, changes):
     """Preview text for the merged /save-trace: shows the trace + attached files."""
     lines = []
-    # Tell the user whether we pinned the LIVE session or fell back to newest.
-    cur = uploader.current_session_file()
     if session_path is not None:
-        tag = "当前会话" if (cur is not None and cur == session_path) else "按最近修改时间猜测"
+        # Classify how we picked this session so the user knows if it's reliable.
+        sp_str = str(session_path)
+        env_sid = os.environ.get("HERMES_SESSION_ID", "").strip()
+        env_file = os.environ.get("HERMES_TUI_ACTIVE_SESSION_FILE", "").strip()
+        if env_file and str(Path(env_file).expanduser()) == sp_str:
+            tag = "当前会话 (来自 HERMES_TUI_ACTIVE_SESSION_FILE)"
+        elif env_sid and env_sid in session_path.name:
+            tag = "当前会话 (来自 HERMES_SESSION_ID)"
+        elif "/trace-saver-dbexport-" in sp_str:
+            tag = "当前会话 (从 state.db 导出)"
+        elif uploader.state_db_available():
+            tag = "按目录 mtime 挑选 (可能是旧会话)"
+        else:
+            tag = "按目录 mtime 挑选"
         lines.append(f"session trace: {session_path.name}  [{tag}]")
-        if cur is None:
+        if "可能是旧会话" in tag:
             lines.append(
-                "  ⚠️  未检测到 HERMES_SESSION_ID，无法确认当前会话；"
-                "如选错请用 /save-trace --yes <session-id> 指定。"
+                "  ⚠️  当前会话可能没写到 sessions/ 目录里；"
+                "用 /save-trace list 查看真实活跃会话，或 --yes <session-id> 指定。"
             )
     else:
         lines.append(f"session trace: {session_label}")
@@ -310,8 +321,46 @@ def _safe_stat(p):
         return 0
 
 
+def _format_session_list(rows) -> str:
+    """Render `list_db_sessions()` output for the /save-trace list subcommand."""
+    if not rows:
+        return "state.db 不可用或没有 session。"
+    from datetime import datetime as _dt
+    lines = ["最近活跃会话 (state.db, 最新在上):",
+             "",
+             f"  {'session id':<28}  {'model':<20}  {'msgs':>4}  {'last active':<19}",
+             f"  {'-'*28}  {'-'*20}  {'-'*4}  {'-'*19}"]
+    for r in rows:
+        last = r["last_msg"]
+        try:
+            last_str = _dt.fromtimestamp(float(last)).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            last_str = str(last)
+        lines.append(
+            f"  {r['id']:<28}  {(r['model'] or '?'):<20}  {r['nmsg']:>4}  {last_str}"
+        )
+    lines.append("")
+    lines.append("上传其中一个:  /save-trace --yes <session-id>")
+    lines.append("(session-id 支持子串匹配,比如时间戳前缀就行)")
+    return "\n".join(lines)
+
+
 def _handle_slash(raw_args: str):
     argv = (raw_args or "").split()
+
+    # `/save-trace list` — show the DB's most-recently-active sessions so the
+    # user can pick one when the auto-detected "latest" is wrong.
+    if argv and argv[0] in ("list", "ls", "sessions"):
+        limit = 15
+        for tok in argv[1:]:
+            if tok.isdigit():
+                limit = max(1, min(int(tok), 100))
+        try:
+            rows = uploader.list_db_sessions(limit=limit)
+        except Exception as exc:  # noqa: BLE001
+            return f"⚠️  read state.db failed: {exc}"
+        return _format_session_list(rows)
+
     try:
         opts = _parse_slash_args(argv)
     except ValueError as exc:
